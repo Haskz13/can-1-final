@@ -3,7 +3,7 @@ data/downloads/
 data/tenders/
 data/backups/
 
-# Python
+# Python cache (but keep source files)
 __pycache__/
 *.py[cod]
 *$py.class
@@ -30,11 +30,10 @@ MANIFEST
 celerybeat-schedule
 celerybeat.pid
 
-# Logs
-logs/
-*.log
+# Logs (but keep log directory structure)
+logs/*.log
 
-# Environment variables
+# Environment variables (but allow .env.example)
 .env
 .env.local
 .env.development.local
