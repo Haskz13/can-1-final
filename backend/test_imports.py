@@ -6,6 +6,7 @@ and the main application can be imported without errors.
 
 import sys
 import os
+from typing import List, Optional, Dict, Any
 
 def test_imports():
     """Test all required imports"""
@@ -22,7 +23,6 @@ def test_imports():
         from pathlib import Path
         from datetime import datetime, timedelta
         from time import sleep
-        from typing import List, Optional, Dict, Any
         from contextlib import asynccontextmanager
         print("✓ Core Python imports successful")
         
