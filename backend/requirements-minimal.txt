@@ -1,0 +1,40 @@
+# backend/requirements-minimal.txt
+# Core Web Framework
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# Database
+sqlalchemy
+alembic
+
+# Web Scraping
+aiohttp
+requests
+beautifulsoup4
+lxml
+selenium
+httpx
+
+# Task Queue and Caching
+celery
+redis
+kombu
+
+# Scheduling
+apscheduler
+
+# Utilities
+python-dateutil
+python-multipart
+python-dotenv
+pyyaml
+tenacity
+
+# Logging
+loguru
+
+# Development tools
+pytest
+pytest-asyncio 

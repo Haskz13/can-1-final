@@ -205,5 +205,27 @@ class SeleniumGridManager:
             logger.error(f"Error finding elements {by}={value}: {e}")
             return []
 
-# Global instance
-selenium_manager = SeleniumGridManager() 
+# Global selenium manager instance
+selenium_manager = None
+
+def get_selenium_manager() -> SeleniumGridManager:
+    """Get or create the global Selenium Grid manager"""
+    global selenium_manager
+    if selenium_manager is None:
+        selenium_manager = SeleniumGridManager()
+    return selenium_manager
+
+def get_driver():
+    """Get a WebDriver instance for the enhanced scrapers"""
+    manager = get_selenium_manager()
+    
+    # Wait for grid to be ready
+    if not manager.wait_for_grid_ready():
+        raise RuntimeError("Selenium Grid is not ready")
+    
+    # Create driver
+    driver = manager.create_driver()
+    if driver is None:
+        raise RuntimeError("Failed to create WebDriver")
+    
+    return driver 

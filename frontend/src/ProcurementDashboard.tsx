@@ -33,7 +33,7 @@ type Stats = {
     last_scan: string | null;
 };
 
-const ProcurementDashboard = () => {
+const ProcurementDashboard: React.FC = () => {
   // Use the new types to define our state
   const [tenders, setTenders] = useState<Tender[]>([]);
   const [loading, setLoading] = useState(false);
@@ -57,7 +57,9 @@ const ProcurementDashboard = () => {
   const [selectedTender, setSelectedTender] = useState<Tender | null>(null);
 
   // Use environment variable or default to localhost for development
-  const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000/api';
+  const API_BASE = (typeof window !== 'undefined' && window.location.hostname === 'localhost') 
+    ? 'http://localhost:8000/api' 
+    : '/api';
 
   // Fetch tenders from API
   const fetchTenders = async () => {
@@ -116,20 +118,46 @@ const ProcurementDashboard = () => {
       setScanningStatus('scanning');
       await fetch(`${API_BASE}/scan`, { method: 'POST' });
       
-      setTimeout(() => {
-        setScanningStatus('updating');
-      }, 3000);
+      // Start real-time refresh during scanning
+      const refreshInterval = setInterval(async () => {
+        try {
+          await fetchTenders();
+          await fetchStats();
+        } catch (error) {
+          console.error('Error during real-time refresh:', error);
+        }
+      }, 5000); // Refresh every 5 seconds during scan
       
       setTimeout(() => {
+        setScanningStatus('updating');
+      }, 5000);
+      
+      // Extended timeout for comprehensive scanning
+      setTimeout(() => {
+        clearInterval(refreshInterval);
         fetchTenders();
         fetchStats();
         setScanningStatus('complete');
-        setTimeout(() => setScanningStatus('idle'), 3000);
-      }, 10000);
+        setTimeout(() => setScanningStatus('idle'), 5000);
+      }, 120000); // 2 minutes timeout for comprehensive scan
     } catch (error) {
       console.error('Error triggering scan:', error);
       setScanningStatus('error');
-      setTimeout(() => setScanningStatus('idle'), 3000);
+      setTimeout(() => setScanningStatus('idle'), 5000);
+    }
+  };
+
+  // Manual refresh function
+  const manualRefresh = async () => {
+    setLoading(true);
+    try {
+      await fetchTenders();
+      await fetchStats();
+    } catch (error) {
+      console.error('Error during manual refresh:', error);
+      setError(error instanceof Error ? error.message : 'Unknown error occurred');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -137,7 +165,7 @@ const ProcurementDashboard = () => {
   const exportToCSV = () => {
     const csv = [
       ['ID', 'Title', 'Organization', 'Portal', 'Value', 'Closing Date', 'Location', 'Priority', 'Matching Courses', 'URL'],
-      ...tenders.map(t => [
+      ...tenders.map((t: Tender) => [
         t.tender_id,
         `"${t.title.replace(/"/g, '""')}"`,
         `"${t.organization.replace(/"/g, '""')}"`,
@@ -165,10 +193,11 @@ const ProcurementDashboard = () => {
     fetchTenders();
     fetchStats();
     
+    // More frequent refresh during active development/testing
     const interval = setInterval(() => {
       fetchTenders();
       fetchStats();
-    }, 300000);
+    }, 30000); // Refresh every 30 seconds instead of 5 minutes
     
     return () => clearInterval(interval);
   }, []);
@@ -255,6 +284,14 @@ const ProcurementDashboard = () => {
                 {scanningStatus === 'idle' ? 'Scan Now' : getScanStatusMessage()}
               </button>
               <button
+                onClick={manualRefresh}
+                disabled={loading}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700 disabled:bg-gray-400"
+              >
+                <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                Refresh Data
+              </button>
+              <button
                 onClick={exportToCSV}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700"
               >
@@ -334,7 +371,7 @@ const ProcurementDashboard = () => {
               Portal Activity
             </h2>
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-              {stats.by_portal.map(portal => (
+              {stats.by_portal.map((portal: { portal: string; count: number; total_value: number }) => (
                 <div key={portal.portal} className="text-center p-3 bg-gray-50 rounded hover:bg-gray-100 transition-colors">
                   <p className="text-sm font-medium text-gray-700">{portal.portal}</p>
                   <p className="text-lg font-bold text-blue-600">{portal.count}</p>
@@ -360,7 +397,7 @@ const ProcurementDashboard = () => {
                   placeholder="Keywords, organization, title..."
                   className="w-full pl-10 pr-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                   value={filters.search}
-                  onChange={(e) => setFilters({...filters, search: e.target.value})}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilters({...filters, search: e.target.value})}
                 />
                 <Search className="w-5 h-5 text-gray-400 absolute left-3 top-2.5" />
               </div>
@@ -370,10 +407,10 @@ const ProcurementDashboard = () => {
               <select
                 className="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                 value={filters.portal}
-                onChange={(e) => setFilters({...filters, portal: e.target.value})}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setFilters({...filters, portal: e.target.value})}
               >
                 <option value="">All Portals</option>
-                {tenders.map(tender => (
+                {tenders.map((tender: Tender) => (
                   <option key={tender.portal} value={tender.portal}>{tender.portal}</option>
                 ))}
               </select>
@@ -385,7 +422,7 @@ const ProcurementDashboard = () => {
                 placeholder="0"
                 className="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                 value={filters.minValue}
-                onChange={(e) => setFilters({...filters, minValue: e.target.value})}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilters({...filters, minValue: e.target.value})}
               />
             </div>
             <div>
@@ -393,7 +430,7 @@ const ProcurementDashboard = () => {
               <select
                 className="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                 value={filters.category}
-                onChange={(e) => setFilters({...filters, category: e.target.value})}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setFilters({...filters, category: e.target.value})}
               >
                 <option value="">All Categories</option>
                 <option value="project-management">Project Management</option>
@@ -414,7 +451,7 @@ const ProcurementDashboard = () => {
                 name="priority"
                 value=""
                 checked={filters.priority === ''}
-                onChange={(e) => setFilters({...filters, priority: e.target.value})}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilters({...filters, priority: e.target.value})}
                 className="mr-2"
               />
               All Priorities
@@ -425,7 +462,7 @@ const ProcurementDashboard = () => {
                 name="priority"
                 value="high"
                 checked={filters.priority === 'high'}
-                onChange={(e) => setFilters({...filters, priority: e.target.value})}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilters({...filters, priority: e.target.value})}
                 className="mr-2"
               />
               <span className="text-red-600">High Priority</span>
@@ -436,7 +473,7 @@ const ProcurementDashboard = () => {
                 name="priority"
                 value="medium"
                 checked={filters.priority === 'medium'}
-                onChange={(e) => setFilters({...filters, priority: e.target.value})}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilters({...filters, priority: e.target.value})}
                 className="mr-2"
               />
               <span className="text-yellow-600">Medium Priority</span>
@@ -461,7 +498,7 @@ const ProcurementDashboard = () => {
             </div>
           ) : (
             <div className="space-y-4">
-              {tenders.map(tender => {
+              {tenders.map((tender: Tender) => {
                 const daysLeft = Math.ceil((new Date(tender.closing_date).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
                 const isClosingSoon = daysLeft <= 7 && daysLeft >= 0;
                 const isExpired = daysLeft < 0;
@@ -506,7 +543,7 @@ const ProcurementDashboard = () => {
                       <div className="mb-3">
                         <span className="text-sm font-medium text-gray-600">Matching TKA Courses: </span>
                         <div className="inline-flex flex-wrap gap-2 mt-1">
-                          {tender.matching_courses.map((course, idx) => (
+                          {tender.matching_courses.map((course: string, idx: number) => (
                             <span
                               key={idx}
                               className="inline-block px-2 py-1 text-xs bg-green-100 text-green-800 rounded"
@@ -524,13 +561,13 @@ const ProcurementDashboard = () => {
                         target="_blank"
                         rel="noopener noreferrer"
                         className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
-                        onClick={(e) => e.stopPropagation()}
+                        onClick={(e: React.MouseEvent) => e.stopPropagation()}
                       >
                         View on Portal
                       </a>
                       <button 
                         className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700"
-                        onClick={(e) => {
+                        onClick={(e: React.MouseEvent) => {
                           e.stopPropagation();
                           // Add to tracking functionality
                         }}
@@ -548,7 +585,7 @@ const ProcurementDashboard = () => {
         {/* Tender Details Modal */}
         {selectedTender && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onClick={() => setSelectedTender(null)}>
-            <div className="bg-white rounded-lg max-w-3xl w-full max-h-[90vh] overflow-y-auto p-6" onClick={(e) => e.stopPropagation()}>
+            <div className="bg-white rounded-lg max-w-3xl w-full max-h-[90vh] overflow-y-auto p-6" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
               <div className="flex justify-between items-start mb-4">
                 <h2 className="text-2xl font-bold text-gray-800">{selectedTender.title}</h2>
                 <button
@@ -612,7 +649,7 @@ const ProcurementDashboard = () => {
                 <div className="mb-6">
                   <h3 className="text-lg font-semibold mb-2">Categories</h3>
                   <div className="flex flex-wrap gap-2">
-                    {selectedTender.categories.map((cat, idx) => (
+                    {selectedTender.categories.map((cat: string, idx: number) => (
                       <span key={idx} className="px-3 py-1 bg-blue-100 text-blue-800 rounded">
                         {cat}
                       </span>
@@ -625,7 +662,7 @@ const ProcurementDashboard = () => {
                 <div className="mb-6">
                   <h3 className="text-lg font-semibold mb-2">Matching TKA Courses</h3>
                   <div className="flex flex-wrap gap-2">
-                    {selectedTender.matching_courses.map((course, idx) => (
+                    {selectedTender.matching_courses.map((course: string, idx: number) => (
                       <span key={idx} className="px-3 py-1 bg-green-100 text-green-800 rounded">
                         {course}
                       </span>

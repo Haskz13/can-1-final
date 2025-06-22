@@ -1,10 +1,11 @@
 # backend/tasks.py
 from celery import Celery
 from celery.schedules import crontab
+from celery.result import AsyncResult
 import os
 from datetime import datetime, timedelta
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, TYPE_CHECKING
 import asyncio
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -18,17 +19,20 @@ import pandas as pd
 from pathlib import Path
 from sqlalchemy import desc
 
-# Import from models module (instead of main)
+# Type checking imports
+if TYPE_CHECKING:
+    from celery import Task
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import from models module
 from models import SessionLocal, Tender, save_tender_to_db
 
-# Import from main module (only what we need)
-from main import (
-    ProcurementScanner, 
-    PORTAL_CONFIGS,
-    TenderMatcher,
-    TKA_COURSES,
-    logger
-)
+# Import from config and matcher modules (instead of main)
+from config import PORTAL_CONFIGS, TKA_COURSES
+from matcher import TenderMatcher
 
 # Import from scrapers module
 from scrapers import (
@@ -37,6 +41,19 @@ from scrapers import (
     SpecializedScrapers,
     HealthEducationScrapers
 )
+
+# Import ProcurementScanner from main (lazy import to avoid circular dependency)
+def get_procurement_scanner():
+    """Lazy import of ProcurementScanner to avoid circular dependency"""
+    import sys
+    import os
+    # Add the current directory to Python path if not already there
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
+    from main import ProcurementScanner
+    return ProcurementScanner()
 
 # Updated dispatcher for new portal configurations
 SCRAPER_DISPATCHER = {
@@ -177,10 +194,12 @@ def _process_tenders(tenders: List[Dict], portal_name: str, results: Dict, match
         db.close()
 
 
-async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str], results: Dict, matcher: TenderMatcher):
+async def _execute_scans_async(portal_ids: List[str], results: Dict, matcher: TenderMatcher):
     """
     The async helper that iterates through portals and calls the correct scraper function.
     """
+    # Lazy import to avoid circular dependency
+    scanner = get_procurement_scanner()
     driver = None
     session = SessionLocal()  # Use SessionLocal for DB session
     
@@ -235,34 +254,60 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
         # Handle dispatcher-based scrapers
         if isinstance(scraper_func_ref, str) and scraper_func_ref in SCRAPER_DISPATCHER:
             scraper_func_ref = SCRAPER_DISPATCHER.get(scraper_func_ref)
-            
-        if not callable(scraper_func_ref):
-            logger.warning(f"No valid scraper function found for portal_id: {portal_id}")
+
+        # Ensure we have a callable function
+        if not scraper_func_ref or not callable(scraper_func_ref):
+            logger.warning(f"No valid scraper function found for portal: {portal_id}")
+            continue
+
+        # Type assertion to ensure scraper_func_ref is callable
+        scraper_func = scraper_func_ref  # type: ignore[assignment]
+        if not hasattr(scraper_func, '__call__'):
+            logger.warning(f"Scraper function for portal {portal_id} is not callable")
             continue
 
         try:
             logger.info(f"Scanning portal: {config['name']}")
-            tenders = []
+            tenders: Any = []
             
-            if config.get('requires_selenium', False):
+            # Determine if portal needs Selenium based on type
+            needs_selenium = portal_type == 'web' or config.get('requires_selenium', False)
+            
+            if needs_selenium:
                 if driver is None:
                     driver = scanner.selenium.create_driver()
                 
                 # Check if the function is a method of the scanner instance
-                if hasattr(scanner, scraper_func_ref.__name__):
-                    method_to_call = getattr(scanner, scraper_func_ref.__name__)
+                if hasattr(scanner, scraper_func.__name__):
+                    method_to_call = getattr(scanner, scraper_func.__name__)
                     # Handle methods that need extra arguments
-                    if scraper_func_ref.__name__ in ['scan_ariba_portal', 'scan_biddingo']:
+                    if scraper_func.__name__ in ['scan_ariba_portal', 'scan_biddingo']:
                          tenders = await method_to_call(config['name'], config)
                     else:
                         tenders = await method_to_call()
                 else: # Static method from scrapers.py
-                    tenders = await scraper_func_ref(driver, scanner.selenium)  # type: ignore[operator]
+                    # Check if the function is async before awaiting
+                    if asyncio.iscoroutinefunction(scraper_func):
+                        tenders = await scraper_func(driver, scanner.selenium)
+                    else:
+                        # Handle sync functions by running them in a thread pool
+                        loop = asyncio.get_event_loop()
+                        tenders = await loop.run_in_executor(None, lambda: scraper_func(driver, scanner.selenium))
             else: # Non-selenium static method
-                tenders = await scraper_func_ref(session)  # type: ignore[operator]
+                # Check if the function is async before awaiting
+                if asyncio.iscoroutinefunction(scraper_func):
+                    tenders = await scraper_func(session)
+                else:
+                    # Handle sync functions by running them in a thread pool
+                    loop = asyncio.get_event_loop()
+                    tenders = await loop.run_in_executor(None, lambda: scraper_func(session))
             
             if tenders:
-                 _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
+                # Ensure tenders is a list before processing
+                if isinstance(tenders, list):
+                    _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
+                else:
+                    logger.warning(f"Unexpected tenders type for {config['name']}: {type(tenders)}")
             # Ensure results['scanned'] and results['errors'] are lists before appending
             if not isinstance(results['scanned'], list):
                 results['scanned'] = []
@@ -283,7 +328,7 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
 @app.task(bind=True, max_retries=3)
 def scan_specific_portals_task(self, portal_ids: List[str]):
     """The new master task that scans a specific list of portals using the dispatcher."""
-    scanner = ProcurementScanner()
+    scanner = get_procurement_scanner()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -292,7 +337,7 @@ def scan_specific_portals_task(self, portal_ids: List[str]):
     
     try:
         loop.run_until_complete(
-            _execute_scans_async(scanner, portal_ids, results, matcher)
+            _execute_scans_async(portal_ids, results, matcher)
         )
     except Exception as e:
         logger.error(f"Fatal error in scan_specific_portals task: {e}")
@@ -307,28 +352,28 @@ def scan_specific_portals_task(self, portal_ids: List[str]):
 def scan_all_portals_task():
     """Scan all configured portals."""
     all_portal_ids = list(PORTAL_CONFIGS.keys())
-    return scan_specific_portals_task.delay(all_portal_ids)  # type: ignore[attr-defined]
+    return scan_specific_portals_task.delay(all_portal_ids)  # type: ignore
 
 
 @app.task
 def scan_high_priority_portals():
     """Scan only high-traffic portals more frequently."""
     high_priority_ids = ['canadabuys', 'merx', 'toronto', 'ontario', 'bcbid', 'seao']
-    return scan_specific_portals_task.delay(high_priority_ids)  # type: ignore[attr-defined]
+    return scan_specific_portals_task.delay(high_priority_ids)  # type: ignore
 
 
 @app.task
 def scan_api_portals():
     """Scan portals with API access for real-time updates."""
     api_portal_ids = [k for k,v in PORTAL_CONFIGS.items() if v.get('type') in ['api', 'api_and_scrape']]
-    return scan_specific_portals_task.delay(api_portal_ids)  # type: ignore[attr-defined]
+    return scan_specific_portals_task.delay(api_portal_ids)  # type: ignore
 
 
 @app.task
 def scan_municipal_portals():
     """Scan all municipal portals."""
     municipal_ids = [k for k,v in PORTAL_CONFIGS.items() if 'City of' in v['name'] or 'Municipality' in v['name']]
-    return scan_specific_portals_task.delay(municipal_ids)  # type: ignore[attr-defined]
+    return scan_specific_portals_task.delay(municipal_ids)  # type: ignore
 
 
 @app.task
@@ -338,7 +383,7 @@ def scan_provincial_portals():
     provincial_ids = [k for k,v in PORTAL_CONFIGS.items() 
                       if any(keyword in v['name'] for keyword in provincial_keywords) 
                       and 'City' not in v['name']]
-    return scan_specific_portals_task.delay(provincial_ids)  # type: ignore[attr-defined]
+    return scan_specific_portals_task.delay(provincial_ids)  # type: ignore
 
 
 @app.task
@@ -399,11 +444,13 @@ def generate_daily_report():
         report_html = generate_report_html(new_today, closing_soon, high_priority)
         
         # Send email if configured
-        if os.getenv('SMTP_HOST') and os.getenv('REPORT_RECIPIENTS'):
+        smtp_host = os.getenv('SMTP_HOST')
+        report_recipients = os.getenv('REPORT_RECIPIENTS')
+        if smtp_host and report_recipients:
             send_email_report(
                 subject=f"Daily Procurement Report - {datetime.now().strftime('%Y-%m-%d')}",
                 body=report_html,
-                recipients=os.getenv('REPORT_RECIPIENTS').split(',')  # type: ignore[attr-defined]
+                recipients=report_recipients.split(',')
             )
             
         return {
@@ -505,16 +552,30 @@ def generate_tender_table(tenders):
 def send_email_report(subject, body, recipients):
     """Send email report"""
     try:
+        smtp_host = os.getenv('SMTP_HOST')
+        smtp_port = os.getenv('SMTP_PORT', '587')
+        smtp_user = os.getenv('SMTP_USER')
+        smtp_password = os.getenv('SMTP_PASSWORD')
+        
+        if not all([smtp_host, smtp_user, smtp_password]):
+            logger.error("Missing required SMTP configuration")
+            return
+            
+        # Type assertion since we've checked they're not None
+        assert smtp_host is not None
+        assert smtp_user is not None
+        assert smtp_password is not None
+            
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
-        msg['From'] = os.getenv('SMTP_USER')
+        msg['From'] = smtp_user
         msg['To'] = ', '.join(recipients)
         
         msg.attach(MIMEText(body, 'html'))
         
-        with smtplib.SMTP(os.getenv('SMTP_HOST'), int(os.getenv('SMTP_PORT', 587))) as server:
+        with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
             server.starttls()
-            server.login(os.getenv('SMTP_USER'), os.getenv('SMTP_PASSWORD'))
+            server.login(smtp_user, smtp_password)
             server.send_message(msg)
             
         logger.info(f"Report sent to {len(recipients)} recipients")

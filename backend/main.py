@@ -3,13 +3,15 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import json
 import hashlib
 import aiohttp
+from selenium.webdriver.common.keys import Keys
+import os
 
 # FastAPI imports
-from fastapi import FastAPI, Depends, BackgroundTasks
+from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -22,16 +24,28 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Import from our new modules
+# Import from our modules
 from models import Base, SessionLocal, Tender, save_tender_to_db, get_db  # type: ignore[reportAny]
-from selenium_utils import selenium_manager
+
+# Import from selenium_utils module
+try:
+    from selenium_utils import selenium_manager, SeleniumGridManager
+except ImportError as e:
+    logger.error(f"Failed to import selenium_manager: {e}")
+    selenium_manager = None
+    SeleniumGridManager = None
+
+from config import PORTAL_CONFIGS, TKA_COURSES
+from matcher import TenderMatcher
 
 # Import scrapers
 from scrapers import (
     ProvincialScrapers,
     MunicipalScrapers,
     SpecializedScrapers,
-    HealthEducationScrapers
+    HealthEducationScrapers,
+    MERXScraper,
+    CanadaBuysScraper
 )
 
 # Configure logging
@@ -41,345 +55,570 @@ logger = logging.getLogger(__name__)
 # Create database tables
 Base.metadata.create_all(bind=SessionLocal().bind)  # type: ignore[reportAny]
 
-# Portal configurations
-PORTAL_CONFIGS = {
-    'canadabuys': {
-        'name': 'CanadaBuys',
-        'type': 'api',
-        'url': 'https://canadabuys.canada.ca',
-        'priority': 'high'
-    },
-    'merx': {
-        'name': 'MERX',
-        'type': 'web',
-        'url': 'https://www.merx.com',
-        'priority': 'high'
-    },
-    'bcbid': {
-        'name': 'BC Bid',
-        'type': 'web',
-        'url': 'https://www.bcbid.gov.bc.ca',
-        'priority': 'high'
-    },
-    'seao': {
-        'name': 'SEAO Quebec',
-        'type': 'web',
-        'url': 'https://seao.gouv.qc.ca',
-        'priority': 'high'
-    },
-    'biddingo': {
-        'name': 'Biddingo',
-        'type': 'web',
-        'url': 'https://www.biddingo.com',
-        'priority': 'medium'
-    },
-    'bidsandtenders': {
-        'name': 'Bids&Tenders',
-        'type': 'web',
-        'url': 'https://www.bidsandtenders.ca',
-        'priority': 'medium'
-    },
-    # Provincial Portals
-    'albertapurchasing': {
-        'name': 'Alberta Purchasing Connection',
-        'type': 'web',
-        'url': 'https://www.alberta.ca/purchasing-connection.aspx',
-        'priority': 'high'
-    },
-    'sasktenders': {
-        'name': 'Saskatchewan Tenders',
-        'type': 'web',
-        'url': 'https://www.sasktenders.ca',
-        'priority': 'high'
-    },
-    'manitoba': {
-        'name': 'Manitoba Tenders',
-        'type': 'web',
-        'url': 'https://www.gov.mb.ca/tenders',
-        'priority': 'high'
-    },
-    'ontario': {
-        'name': 'Ontario Tenders',
-        'type': 'web',
-        'url': 'https://www.ontario.ca/tenders',
-        'priority': 'high'
-    },
-    'ns': {
-        'name': 'Nova Scotia Tenders',
-        'type': 'web',
-        'url': 'https://novascotia.ca/tenders',
-        'priority': 'high'
-    },
-    # Municipal Portals
-    'calgary': {
-        'name': 'City of Calgary Procurement',
-        'type': 'web',
-        'url': 'https://www.calgary.ca/procurement',
-        'priority': 'medium'
-    },
-    'winnipeg': {
-        'name': 'City of Winnipeg Bids',
-        'type': 'web',
-        'url': 'https://www.winnipeg.ca/bids',
-        'priority': 'medium'
-    },
-    'vancouver': {
-        'name': 'City of Vancouver Procurement',
-        'type': 'web',
-        'url': 'https://vancouver.ca/procurement',
-        'priority': 'medium'
-    },
-    'halifax': {
-        'name': 'City of Halifax Procurement',
-        'type': 'web',
-        'url': 'https://www.halifax.ca/procurement',
-        'priority': 'medium'
-    },
-    'regina': {
-        'name': 'City of Regina Procurement',
-        'type': 'web',
-        'url': 'https://www.regina.ca/procurement',
-        'priority': 'medium'
-    },
-    # Specialized Portals
-    'nbon': {
-        'name': 'NBON New Brunswick',
-        'type': 'web',
-        'url': 'https://www.nbon.ca',
-        'priority': 'medium'
-    },
-    'pei': {
-        'name': 'PEI Tenders',
-        'type': 'web',
-        'url': 'https://www.princeedwardisland.ca/tenders',
-        'priority': 'medium'
-    },
-    'nl': {
-        'name': 'Newfoundland Procurement',
-        'type': 'web',
-        'url': 'https://www.gov.nl.ca/procurement',
-        'priority': 'medium'
-    },
-    # Health & Education Portals
-    'buybc': {
-        'name': 'BuyBC Health',
-        'type': 'web',
-        'url': 'https://www.buybc.ca/health',
-        'priority': 'medium'
-    },
-    'mohltc': {
-        'name': 'Ontario Health',
-        'type': 'web',
-        'url': 'https://www.ontariohealth.ca/procurement',
-        'priority': 'medium'
-    },
-    # Bids&Tenders Platform Cities
-    'edmonton': {
-        'name': 'City of Edmonton',
-        'type': 'bidsandtenders',
-        'url': 'https://www.bidsandtenders.ca',
-        'search_url': 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all&rregion=AB',
-        'priority': 'medium'
-    },
-    'ottawa': {
-        'name': 'City of Ottawa',
-        'type': 'bidsandtenders',
-        'url': 'https://www.bidsandtenders.ca',
-        'search_url': 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all&rregion=ON',
-        'priority': 'medium'
-    },
-    'london': {
-        'name': 'City of London',
-        'type': 'bidsandtenders',
-        'url': 'https://www.bidsandtenders.ca',
-        'search_url': 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all&rregion=ON',
-        'priority': 'medium'
-    },
-    'hamilton': {
-        'name': 'City of Hamilton',
-        'type': 'bidsandtenders',
-        'url': 'https://www.bidsandtenders.ca',
-        'search_url': 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all&rregion=ON',
-        'priority': 'medium'
-    },
-    'kitchener': {
-        'name': 'City of Kitchener',
-        'type': 'bidsandtenders',
-        'url': 'https://www.bidsandtenders.ca',
-        'search_url': 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all&rregion=ON',
-        'priority': 'medium'
-    }
+# Advanced search strategies for TKA business optimization
+SEARCH_STRATEGIES = {
+    'primary_keywords': [
+        # Direct training terms - highest priority
+        'training services', 'professional development services', 'education services',
+        'learning development', 'skill development', 'capacity building',
+        'workforce development', 'upskilling', 'reskilling',
+        
+        # Consulting with training components
+        'consulting services', 'advisory services', 'implementation services',
+        'change management', 'digital transformation', 'modernization',
+        'process improvement', 'organizational development'
+    ],
+    
+    'technical_skills': [
+        # Cloud & DevOps - high demand
+        'AWS training', 'Azure training', 'Google Cloud training', 'cloud migration',
+        'DevOps training', 'Kubernetes training', 'Docker training', 'CI/CD training',
+        
+        # Cybersecurity - critical need
+        'cybersecurity training', 'information security training', 'CISSP training',
+        'ethical hacking training', 'security assessment', 'compliance training',
+        
+        # Data & Analytics - growing demand
+        'data analytics training', 'business intelligence training', 'Power BI training',
+        'Tableau training', 'data science training', 'machine learning training',
+        
+        # IT Infrastructure - foundational
+        'ITIL training', 'IT service management', 'network security training',
+        'system administration training', 'database management training'
+    ],
+    
+    'management_skills': [
+        # Project Management - core TKA offering
+        'project management training', 'PMP training', 'PRINCE2 training', 
+        'Agile training', 'Scrum training', 'program management training',
+        
+        # Leadership - executive focus
+        'leadership development', 'management training', 'executive coaching',
+        'team building training', 'organizational development',
+        
+        # Change Management - transformation focus
+        'change management training', 'organizational change', 'transformation training',
+        'process improvement training', 'lean six sigma training'
+    ],
+    
+    'soft_skills': [
+        # Communication - essential for all roles
+        'communication skills training', 'presentation skills training', 
+        'negotiation training', 'conflict resolution training',
+        'emotional intelligence training', 'coaching training',
+        'facilitation training', 'customer service training', 'sales training'
+    ],
+    
+    'compliance_governance': [
+        # Compliance - regulatory requirement
+        'compliance training', 'regulatory compliance training', 'GDPR training',
+        'risk management training', 'audit training', 'governance training',
+        'ethics training', 'anti-money laundering training', 'privacy training'
+    ]
 }
 
-# Training courses for matching
-TKA_COURSES = [
-    "Project Management", "Leadership", "Communication", "Negotiation",
-    "Contract Management", "Procurement", "Supply Chain", "Risk Management",
-    "Strategic Planning", "Change Management", "Team Building", "Conflict Resolution",
-    "Time Management", "Problem Solving", "Decision Making", "Financial Management",
-    "Human Resources", "Marketing", "Sales", "Customer Service", "Quality Management",
-    "Process Improvement", "Innovation", "Digital Transformation", "Data Analysis",
-    "Business Intelligence", "Cybersecurity", "Cloud Computing", "Agile", "Scrum",
-    "Lean Six Sigma", "ISO Standards", "Compliance", "Regulatory Affairs",
-    "Environmental Management", "Sustainability", "Corporate Social Responsibility"
-]
+def generate_search_queries():
+    """Generate multiple search queries for comprehensive coverage"""
+    
+    # Strategy 1: Comprehensive training services search
+    comprehensive_training = [
+        # CanadaBuys: Multiple keywords in quotes
+        '"training services" "professional development" "upskilling"',
+        '"education services" "learning development" "skill development"',
+        '"consulting services" "capacity building" "workforce development"',
+        
+        # MERX: Multiple keywords with AND
+        'training AND services AND professional AND development',
+        'education AND services AND learning AND development',
+        'consulting AND services AND capacity AND building'
+    ]
+    
+    # Strategy 2: Technology-focused comprehensive search
+    tech_comprehensive = [
+        # CanadaBuys: Tech training combinations
+        '"cloud training" "AWS training" "Azure training" "cybersecurity training"',
+        '"DevOps training" "data analytics training" "ITIL training"',
+        '"project management training" "Agile training" "Scrum training"',
+        
+        # MERX: Tech training with AND
+        'cloud AND training AND AWS AND Azure AND cybersecurity',
+        'DevOps AND training AND data AND analytics AND ITIL',
+        'project AND management AND training AND Agile AND Scrum'
+    ]
+    
+    # Strategy 3: Implementation and transformation search
+    implementation_comprehensive = [
+        # CanadaBuys: Implementation combinations
+        '"digital transformation consulting" "change management implementation"',
+        '"system implementation training" "process improvement consulting"',
+        '"organizational development" "transformation services"',
+        
+        # MERX: Implementation with AND
+        'digital AND transformation AND consulting AND change AND management',
+        'system AND implementation AND training AND process AND improvement',
+        'organizational AND development AND transformation AND services'
+    ]
+    
+    # Strategy 4: Certification and professional development
+    certification_comprehensive = [
+        # CanadaBuys: Certification combinations
+        '"certification preparation" "professional certification" "PMP certification"',
+        '"PRINCE2 certification" "CISSP training" "ITIL certification"',
+        '"AWS certification" "Azure certification" "professional development"',
+        
+        # MERX: Certification with AND
+        'certification AND preparation AND professional AND PMP',
+        'PRINCE2 AND certification AND CISSP AND training AND ITIL',
+        'AWS AND certification AND Azure AND professional AND development'
+    ]
+    
+    # Strategy 5: Leadership and organizational development
+    leadership_comprehensive = [
+        # CanadaBuys: Leadership combinations
+        '"leadership development program" "executive coaching services"',
+        '"management development" "team effectiveness training"',
+        '"change management training" "organizational development"',
+        
+        # MERX: Leadership with AND
+        'leadership AND development AND program AND executive AND coaching',
+        'management AND development AND team AND effectiveness AND training',
+        'change AND management AND training AND organizational AND development'
+    ]
+    
+    return {
+        'comprehensive_training': comprehensive_training,
+        'tech_comprehensive': tech_comprehensive,
+        'implementation_comprehensive': implementation_comprehensive,
+        'certification_comprehensive': certification_comprehensive,
+        'leadership_comprehensive': leadership_comprehensive
+    }
 
-class TenderMatcher:
-    """Match tenders to training courses and calculate priority"""
+def format_search_query_for_portal(query: str, portal: str) -> str:
+    """Format search query appropriately for each portal"""
+    if portal.lower() == 'canadabuys':
+        # CanadaBuys: Already formatted with quotes, return as-is
+        return query
+    elif portal.lower() == 'merx':
+        # MERX: Already formatted with AND, return as-is
+        return query
+    else:
+        # Default: return as-is
+        return query
+
+def score_tender_relevance(tender_data):
+    """Score tender relevance based on multiple factors"""
+    score = 0
+    title = tender_data.get('title', '').lower()
+    description = tender_data.get('description', '').lower()
+    text = f"{title} {description}"
     
-    @staticmethod
-    def match_courses(tender: Dict) -> list[str]:
-        """Match tender to relevant training courses"""
-        text = f"{tender.get('title', '')} {tender.get('description', '')}".lower()
-        matched_courses = []
-        
-        for course in TKA_COURSES:
-            if course.lower() in text:
-                matched_courses.append(course)
-        
-        return matched_courses
+    # High-value keywords (worth more points)
+    high_value_terms = {
+        'training': 15, 'professional development': 20, 'certification': 15,
+        'consulting': 10, 'implementation': 8, 'change management': 12,
+        'AWS': 15, 'Azure': 15, 'cybersecurity': 15, 'project management': 15,
+        'agile': 12, 'scrum': 12, 'leadership': 10, 'coaching': 10
+    }
     
-    @staticmethod
-    def calculate_priority(tender: Dict) -> str:
-        """Calculate tender priority based on various factors"""
-        score = 0
-        
-        # Value-based scoring
-        value = tender.get('value', 0)
-        if value > 1000000:
-            score += 5
-        elif value > 500000:
-            score += 3
-        elif value > 100000:
-            score += 2
-        elif value > 50000:
-            score += 1
-        
-        # Time-based scoring
-        closing_date = tender.get('closing_date')
-        if closing_date:
-            days_until_closing = (closing_date - datetime.utcnow()).days
-            if days_until_closing <= 7:
-                score += 5
-            elif days_until_closing <= 14:
-                score += 3
-            elif days_until_closing <= 30:
-                score += 1
-        
-        # Portal-based scoring
-        portal = tender.get('portal', '').lower()
-        if 'canadabuys' in portal:
-            score += 3
-        elif 'merx' in portal:
-            score += 2
-        elif 'bcbid' in portal:
-            score += 2
-        
-        # Course matching scoring
-        if tender.get('matching_courses'):
-            score += len(tender['matching_courses']) * 2
-        
-        # Determine priority
-        if score >= 8:
-            return 'high'
-        elif score >= 5:
-            return 'medium'
-        else:
-            return 'low'
+    # Medium-value keywords
+    medium_value_terms = {
+        'education': 8, 'learning': 8, 'development': 5, 'skills': 5,
+        'workshop': 8, 'seminar': 8, 'course': 8, 'program': 5
+    }
+    
+    # Negative indicators (reduce score)
+    negative_terms = {
+        'equipment': -10, 'construction': -15, 'manufacturing': -10,
+        'supplies': -8, 'maintenance': -8, 'physical': -5
+    }
+    
+    # Calculate score
+    for term, value in {**high_value_terms, **medium_value_terms, **negative_terms}.items():
+        if term in text:
+            score += value
+    
+    # Bonus for multiple relevant terms
+    relevant_count = sum(1 for term in high_value_terms if term in text)
+    if relevant_count >= 2:
+        score += 10
+    
+    # Value-based scoring
+    tender_value = tender_data.get('value', 0)
+    if 50000 <= tender_value <= 2000000:  # Sweet spot for training contracts
+        score += 5
+    
+    return max(score, 0)
+
+def deduplicate_tenders(tenders):
+    """Remove duplicate tenders based on tender_id"""
+    seen_ids = set()
+    unique_tenders = []
+    for tender in tenders:
+        tender_id = tender.get('tender_id', '')
+        if tender_id and tender_id not in seen_ids:
+            seen_ids.add(tender_id)
+            unique_tenders.append(tender)
+    return unique_tenders
 
 class ProcurementScanner:
     """Main procurement scanner class"""
     
     def __init__(self):
-        self.selenium = selenium_manager
+        """Initialize scanner with enhanced scrapers"""
+        self.db = SessionLocal()
+        
+        # Get MERX login credentials from environment variables
+        merx_username = os.getenv('MERX_USERNAME')
+        merx_password = os.getenv('MERX_PASSWORD')
+        
+        # Initialize enhanced scrapers
+        self.portals = {
+            'MERX': MERXScraper(username=merx_username, password=merx_password),
+            'CanadaBuys': CanadaBuysScraper(),
+            # Add more portals as needed
+        }
+        
+        logger.info(f"Initialized scanner with {len(self.portals)} portals")
+        if merx_username:
+            logger.info("MERX login credentials provided")
+        else:
+            logger.info("No MERX login credentials provided - will use public access")
     
     async def get_driver(self):
         """Get Selenium WebDriver with health checks"""
         return self.selenium.create_driver()
     
     async def scan_canadabuys(self) -> list[Dict]:
-        """Scan CanadaBuys portal via API"""
+        """Scan CanadaBuys portal via web scraping with multiple search strategies"""
         tenders = []
+        driver = None
         
         try:
-            logger.info("Scanning CanadaBuys via API...")
+            logger.info("Scanning CanadaBuys via web scraping...")
             
-            # CanadaBuys API endpoints
-            endpoints = [
-                "https://canadabuys.canada.ca/api/v1/opportunities",
-                "https://canadabuys.canada.ca/api/v1/contracts"
+            driver = await self.get_driver()
+            if not driver:
+                logger.error("Could not get driver for CanadaBuys")
+                return tenders
+            
+            # Multiple search strategies to find more tenders
+            search_strategies = [
+                {"term": "training", "description": "Training services"},
+                {"term": "education", "description": "Education services"},
+                {"term": "consulting", "description": "Consulting services"},
+                {"term": "professional development", "description": "Professional development"},
+                {"term": "workshop", "description": "Workshop services"},
+                {"term": "services", "description": "General services"},
+                {"term": "", "description": "All opportunities"}  # No search term to get all
             ]
             
-            async with aiohttp.ClientSession() as session:
-                for endpoint in endpoints:
-                    try:
-                        async with session.get(endpoint) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                
-                                for item in data.get('opportunities', [])[:100]:  # Limit results
-                                    tender_data = self._parse_canadabuys_item(item, endpoint)
-                                    if tender_data:
-                                        tenders.append(tender_data)
-                                        
-                    except Exception as e:
-                        logger.error(f"Error fetching from {endpoint}: {e}")
+            for strategy in search_strategies:
+                try:
+                    logger.info(f"CanadaBuys search strategy: {strategy['description']}")
+                    
+                    # Navigate to CanadaBuys tender opportunities page
+                    base_url = "https://canadabuys.canada.ca/en/tender-opportunities"
+                    if not self.selenium.stealth_navigation(driver, base_url):
+                        logger.error("Failed to navigate to CanadaBuys tender opportunities page")
                         continue
-            
-            logger.info(f"Found {len(tenders)} tenders from CanadaBuys")
+                    
+                    # Wait for page to load
+                    await asyncio.sleep(5)
+                    
+                    # Try to interact with the search form to get results
+                    if strategy['term']:
+                        try:
+                            # Look for search input and submit button
+                            search_input = self.selenium.find_element_safe(driver, By.CSS_SELECTOR, "input[name='keys'], input[placeholder*='Search'], input[type='text']", timeout=10)
+                            if search_input:
+                                # Enter a search term to get results
+                                search_input.clear()
+                                search_input.send_keys(strategy['term'])
                                 
+                                # Find and click submit button
+                                submit_button = self.selenium.find_element_safe(driver, By.CSS_SELECTOR, "input[type='submit'], button[type='submit'], .form-submit, button[class*='search']", timeout=5)
+                                if submit_button:
+                                    submit_button.click()
+                                    await asyncio.sleep(3)
+                                    logger.info(f"Submitted search form for: {strategy['term']}")
+                                else:
+                                    # Try pressing Enter
+                                    search_input.send_keys(Keys.RETURN)
+                                    await asyncio.sleep(3)
+                                    logger.info(f"Submitted search with Enter key for: {strategy['term']}")
+                                    
+                        except Exception as e:
+                            logger.warning(f"Could not interact with search form for {strategy['term']}: {e}")
+                    
+                    # Process multiple pages for this search strategy
+                    page_num = 1
+                    max_pages_per_strategy = 10
+                    
+                    while page_num <= max_pages_per_strategy:
+                        try:
+                            logger.info(f"Processing CanadaBuys page {page_num} for search: {strategy['term']}")
+                            
+                            # Wait for page to load
+                            await asyncio.sleep(3)
+                            
+                            # Look for tender listings with updated selectors
+                            tender_elements = []
+                            selectors = [
+                                ".search-result",           # Common search result class
+                                ".opportunity-item",        # Opportunity items
+                                ".tender-result",           # Tender results
+                                "article",                  # Article elements (common for listings)
+                                ".result-item",             # Result items
+                                "div[class*='result']",     # Any div with 'result' in class
+                                "div[class*='opportunity']", # Any div with 'opportunity' in class
+                                "a[href*='/tender-opportunities/']",  # Links to tender opportunities
+                                ".tender-listing",          # Tender listings
+                                ".opportunity-listing",     # Opportunity listings
+                                "div[class*='listing']",    # Any listing div
+                                "div[class*='item']"        # Any item div
+                            ]
+                            
+                            for selector in selectors:
+                                elements = self.selenium.find_elements_safe(driver, By.CSS_SELECTOR, selector, timeout=5)
+                                if elements and len(elements) > 0:
+                                    tender_elements = elements
+                                    logger.info(f"Found {len(elements)} elements using selector: {selector}")
+                                    break
+                            
+                            # If still no specific elements, try to find any links that might be tenders
+                            if not tender_elements or len(tender_elements) < 5:
+                                logger.info("No specific tender elements found, searching for general links...")
+                                try:
+                                    all_links = driver.find_elements(By.TAG_NAME, "a")
+                                    tender_elements = []
+                                    for link in all_links:
+                                        try:
+                                            href = link.get_attribute('href')
+                                            if href and ('/tender-opportunities/' in href or 'opportunity' in href.lower()):
+                                                tender_elements.append(link)
+                                        except Exception as e:
+                                            logger.warning(f"Error getting href from link: {e}")
+                                            continue
+                                    logger.info(f"Found {len(tender_elements)} potential tender links")
+                                except Exception as e:
+                                    logger.error(f"Error searching for general links: {e}")
+                                    tender_elements = []
+                            
+                            # Parse found elements
+                            page_tenders = []
+                            processed_count = 0
+                            for element in tender_elements[:50]:  # Limit to first 50 per page
+                                try:
+                                    tender_data = self._parse_canadabuys_element(element, strategy['term'])
+                                    if tender_data:
+                                        page_tenders.append(tender_data)
+                                        processed_count += 1
+                                        if processed_count >= 20:  # Limit to 20 tenders per page
+                                            break
+                                except Exception as e:
+                                    logger.warning(f"Error parsing CanadaBuys element: {e}")
+                                    continue
+                            
+                            logger.info(f"Page {page_num}: Found {len(page_tenders)} tenders for search '{strategy['term']}'")
+                            tenders.extend(page_tenders)
+                            
+                            # Try to go to next page
+                            if page_num < max_pages_per_strategy:
+                                try:
+                                    # Look for "Load More" button
+                                    load_more_selectors = [
+                                        "button[class*='load-more']",
+                                        "button[class*='Load More']",
+                                        "a[class*='load-more']",
+                                        ".load-more",
+                                        "button:contains('Load More')",
+                                        "button:contains('Show More')",
+                                        "a:contains('Load More')",
+                                        "a:contains('Show More')"
+                                    ]
+                                    
+                                    load_more_clicked = False
+                                    for selector in load_more_selectors:
+                                        try:
+                                            load_more_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                                            if load_more_btn and load_more_btn.is_displayed():
+                                                driver.execute_script("arguments[0].click();", load_more_btn)
+                                                await asyncio.sleep(3)
+                                                logger.info(f"Clicked 'Load More' button on page {page_num}")
+                                                load_more_clicked = True
+                                                break
+                                        except:
+                                            continue
+                                    
+                                    # If no "Load More" button, try pagination
+                                    if not load_more_clicked:
+                                        pagination_selectors = [
+                                            "a[class*='next']",
+                                            "a[class*='Next']",
+                                            ".pagination .next",
+                                            ".pagination a[href*='page']",
+                                            "a[aria-label*='Next']",
+                                            "a[title*='Next']"
+                                        ]
+                                        
+                                        page_advanced = False
+                                        for selector in pagination_selectors:
+                                            try:
+                                                next_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                                                if next_btn and next_btn.is_displayed() and next_btn.is_enabled():
+                                                    driver.execute_script("arguments[0].click();", next_btn)
+                                                    await asyncio.sleep(3)
+                                                    logger.info(f"Clicked 'Next' button on page {page_num}")
+                                                    page_advanced = True
+                                                    break
+                                            except:
+                                                continue
+                                        
+                                        if not page_advanced:
+                                            # If no pagination found, try to construct next page URL
+                                            current_url = driver.current_url
+                                            if 'page=' in current_url:
+                                                # Replace page number
+                                                next_url = current_url.replace(f'page={page_num}', f'page={page_num + 1}')
+                                            else:
+                                                # Add page parameter
+                                                separator = '&' if '?' in current_url else '?'
+                                                next_url = f"{current_url}{separator}page={page_num + 1}"
+                                            
+                                            driver.get(next_url)
+                                            await asyncio.sleep(3)
+                                            logger.info(f"Navigated to next page URL: {next_url}")
+                                            page_advanced = True
+                                        
+                                        if not page_advanced:
+                                            logger.info(f"No more pages available for search '{strategy['term']}'")
+                                            break
+                                    
+                                except Exception as e:
+                                    logger.warning(f"Error navigating to next page: {e}")
+                                    break  # Stop if we can't navigate further
+                            
+                            page_num += 1
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing CanadaBuys page {page_num}: {e}")
+                            break
+                    
+                except Exception as e:
+                    logger.error(f"Error with search strategy {strategy['description']}: {e}")
+                    continue
+            
+            logger.info(f"Found {len(tenders)} total tenders from CanadaBuys")
+            
         except Exception as e:
             logger.error(f"Error scanning CanadaBuys: {e}")
+        finally:
+            if driver:
+                driver.quit()
             
         return tenders
     
-    def _parse_canadabuys_item(self, item: Dict, endpoint_type: str) -> Optional[Dict]:
-        """Parse CanadaBuys API item"""
+    def _parse_canadabuys_element(self, element, search_term: str) -> Optional[Dict]:
+        """Parse CanadaBuys web element"""
         try:
-            tender_id = item.get('id', '')
-            title = item.get('title', '')
-            organization = item.get('organization', {}).get('name', 'Government of Canada')
+            # Get the href attribute first
+            href = element.get_attribute('href')
+            if not href or '/tender-opportunities/' not in href:
+                return None
             
-            # Parse dates
-            closing_date = None
-            if item.get('closing_date'):
+            # Extract tender ID from URL
+            tender_id = ""
+            if '/tender-opportunities/' in href:
+                # Extract the tender ID from the URL
+                url_parts = href.split('/tender-opportunities/')
+                if len(url_parts) > 1:
+                    tender_id = url_parts[1].split('/')[0].split('?')[0]
+            
+            # Try to get the title from the element text
+            title = ""
+            try:
+                title = element.text.strip()
+            except:
+                pass
+            
+            # If no title from text, try to get it from child elements
+            if not title or len(title) < 5:
                 try:
-                    closing_date = datetime.fromisoformat(item['closing_date'].replace('Z', '+00:00'))
-                except (ValueError, TypeError):
+                    # Look for title in child elements
+                    title_elements = element.find_elements(By.CSS_SELECTOR, "h1, h2, h3, h4, h5, .title, .tender-title, .opportunity-title")
+                    for title_elem in title_elements:
+                        if title_elem.text.strip():
+                            title = title_elem.text.strip()
+                            break
+                except:
                     pass
             
-            # Parse value
-            value = 0.0
-            if item.get('estimated_value'):
+            # If still no title, try to get it from aria-label or title attribute
+            if not title or len(title) < 5:
                 try:
-                    value = float(item['estimated_value'])
-                except (ValueError, TypeError):
+                    aria_label = element.get_attribute('aria-label')
+                    title_attr = element.get_attribute('title')
+                    title = aria_label or title_attr or ""
+                except:
                     pass
             
-            return {
-                'tender_id': f"CB_{tender_id}",
+            # If we still don't have a proper title, try to extract from the URL
+            if not title or len(title) < 5:
+                try:
+                    # Try to extract title from URL path
+                    url_path = href.split('/tender-opportunities/')[1]
+                    title = url_path.replace('-', ' ').replace('_', ' ').title()
+                except:
+                    pass
+            
+            # If we can't get a proper title, skip this element
+            if not title or len(title) < 5:
+                return None
+            
+            # Check if this is training-related (be more lenient)
+            title_lower = title.lower()
+            training_keywords = [
+                'training', 'education', 'professional development', 'workshop', 'seminar', 'course',
+                'learning', 'instruction', 'teaching', 'mentoring', 'coaching', 'consulting',
+                'advisory', 'support', 'services', 'expertise', 'knowledge', 'skills'
+            ]
+            
+            # Check if any training keywords are in the title
+            is_training = any(keyword in title_lower for keyword in training_keywords)
+            
+            # If not training-related, still include it but mark as low priority
+            if not is_training:
+                # For CanadaBuys, include all tenders but mark non-training ones as low priority
+                pass
+            
+            # Create tender data
+            tender_data = {
+                'tender_id': f"CB_{tender_id}" if tender_id else f"CB_{hash(title)}",
                 'title': title,
-                'organization': organization,
+                'organization': 'Government of Canada',
                 'portal': 'CanadaBuys',
                 'portal_url': 'https://canadabuys.canada.ca',
-                'value': value,
-                'closing_date': closing_date,
+                'value': 0.0,
+                'closing_date': None,
                 'posted_date': datetime.utcnow(),
-                'description': item.get('description', ''),
-                'location': item.get('location', ''),
+                'description': title,
+                'location': '',
                 'categories': [],
                 'keywords': [],
-                'tender_url': item.get('url', ''),
-                'documents_url': item.get('documents_url', ''),
-                'is_active': True
+                'tender_url': href,
+                'documents_url': '',
+                'is_active': True,
+                'priority': 'low' if not is_training else 'medium'
             }
             
+            return tender_data
+            
         except Exception as e:
-            logger.warning(f"Error parsing CanadaBuys item: {e}")
+            logger.warning(f"Error parsing CanadaBuys element: {e}")
             return None
     
     async def scan_merx(self) -> list[Dict]:
-        """Scan MERX portal for training tenders"""
+        """Scan MERX portal for training tenders with multiple search strategies"""
         final_tenders: list[Dict] = []
         tenders: list[Dict] = []
         driver = None
@@ -392,185 +631,255 @@ class ProcurementScanner:
             
             logger.info("Scanning MERX portal for training tenders...")
             
-            # Navigate to MERX open solicitations page (more reliable than search)
-            base_url = "https://www.merx.com/public/solicitations/open?"
-            if not self.selenium.stealth_navigation(driver, base_url):
-                logger.error("Failed to navigate to MERX open solicitations page")
-                return final_tenders
-            
-            # Handle cookie consent if present
-            try:
-                cookie_button = driver.find_element(By.CSS_SELECTOR, ".cookie-consent-buttons button, .accept-cookies, .cookie-accept")
-                if cookie_button:
-                    cookie_button.click()
-                    await asyncio.sleep(2)
-                    logger.info("Accepted cookies")
-            except Exception:
-                pass  # No cookie banner found
-            
-            # Training-related keywords to filter for (focus on services, not equipment/supplies)
-            training_keywords = [
-                # Core training and education services
-                "training", "education", "professional development", "learning",
-                "workshop", "seminar", "course", "curriculum", "instruction",
-                "teaching", "facilitation", "mentoring", "coaching", "certification",
-                "accreditation", "workshop", "conference", "symposium", "webinar",
-                "e-learning", "online learning", "distance learning", "virtual training",
-                
-                # Educational services and programs
-                "educational services", "training program", "learning program",
-                "professional training", "skill development", "capacity building",
-                "leadership development", "management training", "technical training",
-                "safety training", "compliance training", "regulatory training",
-                
-                # Education institutions (services they provide)
-                "school board", "school district", "university", "college", "academy",
-                "institute", "campus", "academic services", "educational consulting",
-                "curriculum development", "instructional design", "assessment",
-                "evaluation", "accreditation", "certification program",
-                
-                # Government education services
-                "ministry of education", "department of education", "education authority",
-                "public education", "post-secondary", "higher education",
-                "continuing education", "adult education", "vocational training",
-                "apprenticeship", "skills training", "workforce development",
-                
-                # Training delivery methods
-                "instructor", "trainer", "facilitator", "consultant", "coach",
-                "mentor", "tutor", "educator", "teacher", "professor",
-                "presenter", "speaker", "moderator", "coordinator"
+            # Multiple search strategies to find more tenders
+            search_strategies = [
+                {"url": "https://www.merx.com/public/solicitations/open?", "description": "Open solicitations"},
+                {"url": "https://www.merx.com/public/solicitations/open?keywords=training", "description": "Training keyword search"},
+                {"url": "https://www.merx.com/public/solicitations/open?keywords=education", "description": "Education keyword search"},
+                {"url": "https://www.merx.com/public/solicitations/open?keywords=consulting", "description": "Consulting keyword search"},
+                {"url": "https://www.merx.com/public/solicitations/open?keywords=services", "description": "Services keyword search"},
+                {"url": "https://www.merx.com/public/solicitations/open?keywords=professional", "description": "Professional keyword search"}
             ]
             
-            # Keywords to EXCLUDE (equipment, supplies, physical materials)
-            exclude_keywords = [
-                "equipment", "supplies", "materials", "furniture", "textbooks",
-                "books", "computers", "software", "hardware", "devices",
-                "instruments", "tools", "machinery", "vehicles", "construction",
-                "building", "maintenance", "repair", "installation", "purchase",
-                "procurement", "acquisition", "buy", "purchase", "lease",
-                "rental", "equipment rental", "supply contract", "materials contract"
-            ]
-            
-            # Process multiple pages to find training tenders
-            max_pages = 50  # Increased from 10 to 50 to get more results
-            page_tenders = []
-            
-            for page_num in range(1, max_pages + 1):
+            for strategy in search_strategies:
                 try:
-                    logger.info(f"Processing MERX page {page_num}")
+                    logger.info(f"MERX search strategy: {strategy['description']}")
                     
-                    # Wait for page to load
-                    WebDriverWait(driver, 15).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "table, .results, .solicitation-item, tr"))
-                    )
+                    # Navigate to MERX search page
+                    if not self.selenium.stealth_navigation(driver, strategy['url']):
+                        logger.error(f"Failed to navigate to MERX: {strategy['url']}")
+                        continue
                     
-                    # Find tender elements on current page
-                    tender_elements = []
-                    selectors = [
-                        "tr[data-solicitation-id]",  # Table rows with solicitation data
-                        ".solicitation-item",         # Solicitation items
-                        ".opportunity-item",          # Opportunity items
-                        "tr:has(td)",                 # Table rows with cells
-                        ".result-item",               # Result items
-                        "a[href*='/solicitations/']", # Solicitation links
-                        "tr"                          # Any table row as fallback
+                    # Handle cookie consent if present
+                    try:
+                        cookie_button = driver.find_element(By.CSS_SELECTOR, ".cookie-consent-buttons button, .accept-cookies, .cookie-accept")
+                        if cookie_button:
+                            cookie_button.click()
+                            await asyncio.sleep(2)
+                            logger.info("Accepted cookies")
+                    except Exception:
+                        pass  # No cookie banner found
+                    
+                    # Training-related keywords to filter for (focus on services, not equipment/supplies)
+                    training_keywords = [
+                        # Core training and education services
+                        "training", "education", "professional development", "learning",
+                        "workshop", "seminar", "course", "curriculum", "instruction",
+                        "teaching", "facilitation", "mentoring", "coaching", "certification",
+                        "accreditation", "workshop", "conference", "symposium", "webinar",
+                        "e-learning", "online learning", "distance learning", "virtual training",
+                        
+                        # Educational services and programs
+                        "educational services", "training program", "learning program",
+                        "professional training", "skill development", "capacity building",
+                        "leadership development", "management training", "technical training",
+                        "safety training", "compliance training", "regulatory training",
+                        
+                        # Education institutions (services they provide)
+                        "school board", "school district", "university", "college", "academy",
+                        "institute", "campus", "academic services", "educational consulting",
+                        "curriculum development", "instructional design", "assessment",
+                        "evaluation", "accreditation", "certification program",
+                        
+                        # Government education services
+                        "ministry of education", "department of education", "education authority",
+                        "public education", "post-secondary", "higher education",
+                        "continuing education", "adult education", "vocational training",
+                        "apprenticeship", "skills training", "workforce development",
+                        
+                        # Training delivery methods
+                        "instructor", "trainer", "facilitator", "consultant", "coach",
+                        "mentor", "tutor", "educator", "teacher", "professor",
+                        "presenter", "speaker", "moderator", "coordinator",
+                        
+                        # Additional service keywords
+                        "consulting", "advisory", "support", "services", "expertise",
+                        "knowledge", "skills", "development", "improvement", "enhancement"
                     ]
                     
-                    for selector in selectors:
-                        elements = self.selenium.find_elements_safe(driver, By.CSS_SELECTOR, selector, timeout=5)  # type: ignore[arg-type]
-                        if elements:
-                            tender_elements = elements
-                            logger.info(f"Found {len(elements)} elements using selector: {selector}")
+                    # Keywords to EXCLUDE (equipment, supplies, physical materials)
+                    exclude_keywords = [
+                        "equipment", "supplies", "materials", "furniture", "textbooks",
+                        "books", "computers", "software", "hardware", "devices",
+                        "instruments", "tools", "machinery", "vehicles", "construction",
+                        "building", "maintenance", "repair", "installation", "purchase",
+                        "procurement", "acquisition", "buy", "purchase", "lease",
+                        "rental", "equipment rental", "supply contract", "materials contract"
+                    ]
+                    
+                    # Process multiple pages to find training tenders
+                    max_pages = 20  # Increased to get more results
+                    page_tenders = []
+                    
+                    for page_num in range(1, max_pages + 1):
+                        try:
+                            logger.info(f"Processing MERX page {page_num} for strategy: {strategy['description']}")
+                            
+                            # Wait for page to load
+                            WebDriverWait(driver, 15).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, "table, .results, .solicitation-item, tr"))
+                            )
+                            
+                            # Find tender elements on current page
+                            tender_elements = []
+                            selectors = [
+                                "tr[data-solicitation-id]",  # Table rows with solicitation data
+                                ".solicitation-item",         # Solicitation items
+                                ".opportunity-item",          # Opportunity items
+                                "tr:has(td)",                 # Table rows with cells
+                                ".result-item",               # Result items
+                                "a[href*='/solicitations/']", # Solicitation links
+                                "tr"                          # Any table row as fallback
+                            ]
+                            
+                            for selector in selectors:
+                                elements = self.selenium.find_elements_safe(driver, By.CSS_SELECTOR, selector, timeout=5)  # type: ignore[arg-type]
+                                if elements:
+                                    tender_elements = elements
+                                    logger.info(f"Found {len(elements)} elements using selector: {selector}")
+                                    break
+                            
+                            # Parse tenders on current page and filter for training content
+                            page_count = 0
+                            training_count = 0
+                            
+                            for element in tender_elements:
+                                try:
+                                    tender_data = self._parse_merx_opportunity(element)
+                                    if tender_data:
+                                        page_count += 1
+                                        
+                                        # Check if this tender is training-related
+                                        title_lower = tender_data['title'].lower()
+                                        description_lower = tender_data.get('description', '').lower()
+                                        
+                                        # First check if it contains training keywords
+                                        is_training = any(keyword in title_lower or keyword in description_lower 
+                                                         for keyword in training_keywords)
+                                        
+                                        # Then check if it should be excluded (equipment/supplies)
+                                        should_exclude = any(exclude_keyword in title_lower or exclude_keyword in description_lower 
+                                                            for exclude_keyword in exclude_keywords)
+                                        
+                                        if is_training and not should_exclude:
+                                            # Add training keywords to the tender
+                                            found_keywords = [kw for kw in training_keywords 
+                                                             if kw in title_lower or kw in description_lower]
+                                            tender_data['keywords'] = found_keywords
+                                            tender_data['categories'] = ['Training', 'Education', 'Professional Development']
+                                            page_tenders.append(tender_data)
+                                            training_count += 1
+                                except Exception as e:
+                                    logger.warning(f"Error parsing MERX opportunity: {e}")
+                                    continue
+                            
+                            logger.info(f"Page {page_num}: Found {page_count} total tenders, {training_count} training-related")
+                            
+                            # Try to go to next page or load more results
+                            if page_num < max_pages:
+                                try:
+                                    # Look for "Load More" button
+                                    load_more_selectors = [
+                                        "button[class*='load-more']",
+                                        "button[class*='Load More']",
+                                        "a[class*='load-more']",
+                                        ".load-more",
+                                        "button:contains('Load More')",
+                                        "button:contains('Show More')",
+                                        "a:contains('Load More')",
+                                        "a:contains('Show More')"
+                                    ]
+                                    
+                                    load_more_clicked = False
+                                    for selector in load_more_selectors:
+                                        try:
+                                            load_more_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                                            if load_more_btn and load_more_btn.is_displayed():
+                                                driver.execute_script("arguments[0].click();", load_more_btn)
+                                                await asyncio.sleep(3)
+                                                logger.info(f"Clicked 'Load More' button on page {page_num}")
+                                                load_more_clicked = True
+                                                break
+                                        except:
+                                            continue
+                                    
+                                    # If no "Load More" button, try pagination
+                                    if not load_more_clicked:
+                                        pagination_selectors = [
+                                            "a[class*='next']",
+                                            "a[class*='Next']",
+                                            ".pagination .next",
+                                            ".pagination a[href*='page']",
+                                            "a[aria-label*='Next']",
+                                            "a[title*='Next']"
+                                        ]
+                                        
+                                        page_advanced = False
+                                        for selector in pagination_selectors:
+                                            try:
+                                                next_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                                                if next_btn and next_btn.is_displayed() and next_btn.is_enabled():
+                                                    driver.execute_script("arguments[0].click();", next_btn)
+                                                    await asyncio.sleep(3)
+                                                    logger.info(f"Clicked 'Next' button on page {page_num}")
+                                                    page_advanced = True
+                                                    break
+                                            except:
+                                                continue
+                                        
+                                        if not page_advanced:
+                                            # If no pagination found, try to construct next page URL
+                                            current_url = driver.current_url
+                                            if 'page=' in current_url:
+                                                # Replace page number
+                                                next_url = current_url.replace(f'page={page_num}', f'page={page_num + 1}')
+                                            else:
+                                                # Add page parameter
+                                                separator = '&' if '?' in current_url else '?'
+                                                next_url = f"{current_url}{separator}page={page_num + 1}"
+                                            
+                                            driver.get(next_url)
+                                            await asyncio.sleep(3)
+                                            logger.info(f"Navigated to next page URL: {next_url}")
+                                            page_advanced = True
+                                        
+                                        if not page_advanced:
+                                            logger.info(f"No more pages available for strategy: {strategy['description']}")
+                                            break
+                                    
+                                except Exception as e:
+                                    logger.warning(f"Error navigating to next page: {e}")
+                                    break  # Stop if we can't navigate further
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing MERX page {page_num}: {e}")
                             break
                     
-                    # Parse tenders on current page and filter for training content
-                    page_count = 0
-                    training_count = 0
+                    # Add tenders from this strategy
+                    tenders.extend(page_tenders)
+                    logger.info(f"Strategy '{strategy['description']}': Found {len(page_tenders)} training tenders")
                     
-                    for element in tender_elements:
-                        try:
-                            tender_data = self._parse_merx_opportunity(element)
-                            if tender_data:
-                                page_count += 1
-                                
-                                # Check if this tender is training-related
-                                title_lower = tender_data['title'].lower()
-                                description_lower = tender_data.get('description', '').lower()
-                                
-                                # First check if it contains training keywords
-                                is_training = any(keyword in title_lower or keyword in description_lower 
-                                                 for keyword in training_keywords)
-                                
-                                # Then check if it should be excluded (equipment/supplies)
-                                should_exclude = any(exclude_keyword in title_lower or exclude_keyword in description_lower 
-                                                    for exclude_keyword in exclude_keywords)
-                                
-                                if is_training and not should_exclude:
-                                    # Add training keywords to the tender
-                                    found_keywords = [kw for kw in training_keywords 
-                                                     if kw in title_lower or kw in description_lower]
-                                    tender_data['keywords'] = found_keywords
-                                    tender_data['categories'] = ['Training', 'Education', 'Professional Development']
-                                    page_tenders.append(tender_data)
-                                    training_count += 1
-                                    
-                        except Exception as e:
-                            logger.warning(f"Error parsing MERX opportunity: {e}")
-                            continue
-                    
-                    logger.info(f"Page {page_num}: Found {page_count} total tenders, {training_count} training-related")
-                    
-                    # If we found no tenders on this page, we might be at the end
-                    if page_count == 0:
-                        logger.info("No tenders found on this page, stopping pagination")
-                        break
-                    
-                    # Try to go to next page
-                    if page_num < max_pages:
-                        next_button = self.selenium.find_element_safe(
-                            driver, By.CSS_SELECTOR,  # type: ignore[arg-type]
-                            "a[rel='next'], .next, .pagination-next"
-                        )
-                        
-                        if next_button and next_button.is_enabled():
-                            next_button.click()
-                            # Wait for page transition
-                            await asyncio.sleep(3)
-                        else:
-                            # Try alternative pagination methods
-                            try:
-                                # Look for page number links
-                                next_page_link = driver.find_element(By.CSS_SELECTOR, f"a[href*='page={page_num + 1}'], a[href*='p={page_num + 1}']")
-                                if next_page_link:
-                                    next_page_link.click()
-                                    await asyncio.sleep(3)
-                                    continue
-                            except Exception:
-                                pass
-                            
-                            logger.info("No more pages available")
-                        break
-                    else:
-                        logger.info(f"Reached max pages ({max_pages})")
-                    break
-                        
                 except Exception as e:
-                    logger.warning(f"Error processing page {page_num}: {e}")
-                    break
+                    logger.error(f"Error with MERX search strategy {strategy['description']}: {e}")
+                    continue
             
             # Remove duplicates based on tender_id
-            unique_tenders = {}
-            for tender in page_tenders:
-                unique_tenders[tender['tender_id']] = tender
+            seen_ids = set()
+            unique_tenders = []
+            for tender in tenders:
+                if tender['tender_id'] not in seen_ids:
+                    seen_ids.add(tender['tender_id'])
+                    unique_tenders.append(tender)
             
-            final_tenders = list(unique_tenders.values())
-            logger.info(f"Found {len(final_tenders)} unique training tenders from MERX")
-                    
+            logger.info(f"Found {len(unique_tenders)} unique training tenders from MERX")
+            final_tenders = unique_tenders
+            
         except Exception as e:
             logger.error(f"Error scanning MERX: {e}")
         finally:
-            self.selenium.safe_quit_driver(driver)
-        
+            if driver:
+                driver.quit()
+            
         return final_tenders
     
     def _parse_merx_opportunity(self, element) -> Optional[Dict]:
@@ -1014,6 +1323,112 @@ class ProcurementScanner:
             logger.warning(f"Error parsing Bids&Tenders opportunity: {e}")
             return None
 
+    async def scan(self):
+        """Enhanced scan with multiple search strategies"""
+        logger.info("Starting enhanced procurement scan with multiple strategies")
+        
+        all_tenders = []
+        search_strategies = generate_search_queries()
+        
+        # Scan each portal with multiple strategies
+        for portal_name, portal_scanner in self.portals.items():
+            logger.info(f"Scanning {portal_name} with enhanced strategies")
+            
+            try:
+                portal_tenders = []
+                
+                # Execute multiple search strategies for each portal
+                for strategy_name, queries in search_strategies.items():
+                    logger.info(f"Executing {strategy_name} strategy on {portal_name}")
+                    
+                    for query in queries:
+                        try:
+                            # Select appropriate query format for each portal
+                            if portal_name.lower() == 'canadabuys':
+                                # Use quoted searches for CanadaBuys
+                                if 'AND' not in query:  # Use quoted format
+                                    formatted_query = query
+                                else:
+                                    # Convert AND format to quoted format for CanadaBuys
+                                    keywords = query.replace(' AND ', ' ').split()
+                                    formatted_query = ' '.join([f'"{kw}"' for kw in keywords])
+                            elif portal_name.lower() == 'merx':
+                                # Use AND searches for MERX
+                                if 'AND' in query:  # Use AND format
+                                    formatted_query = query
+                                else:
+                                    # Convert quoted format to AND format for MERX
+                                    keywords = query.replace('"', '').split()
+                                    formatted_query = ' AND '.join(keywords)
+                            else:
+                                formatted_query = query
+                            
+                            logger.info(f"Searching {portal_name} with query: '{formatted_query}' (original: '{query}')")
+                            results = await portal_scanner.search(formatted_query)
+                            
+                            # Score and enhance results
+                            scored_results = []
+                            for result in results:
+                                scored_result = {
+                                    **result,
+                                    'relevance_score': score_tender_relevance(result),
+                                    'search_strategy': strategy_name,
+                                    'search_query': query
+                                }
+                                scored_results.append(scored_result)
+                            
+                            portal_tenders.extend(scored_results)
+                            logger.info(f"Found {len(scored_results)} results for query '{formatted_query}' on {portal_name}")
+                            
+                        except Exception as e:
+                            logger.warning(f"Search failed for '{query}' on {portal_name}: {e}")
+                            continue
+                
+                # Deduplicate and sort by relevance for this portal
+                unique_portal_tenders = deduplicate_tenders(portal_tenders)
+                sorted_tenders = sorted(unique_portal_tenders, key=lambda x: x.get('relevance_score', 0), reverse=True)
+                
+                # Filter for minimum relevance score (remove low-quality matches)
+                relevant_tenders = [t for t in sorted_tenders if t.get('relevance_score', 0) >= 5]
+                
+                logger.info(f"Portal {portal_name}: {len(portal_tenders)} total results, {len(unique_portal_tenders)} unique, {len(relevant_tenders)} relevant")
+                all_tenders.extend(relevant_tenders)
+                
+            except Exception as e:
+                logger.error(f"Error scanning {portal_name}: {e}")
+                continue
+        
+        # Final deduplication across all portals
+        final_tenders = deduplicate_tenders(all_tenders)
+        final_tenders = sorted(final_tenders, key=lambda x: x.get('relevance_score', 0), reverse=True)
+        
+        logger.info(f"Enhanced scan complete: {len(all_tenders)} total results, {len(final_tenders)} unique relevant tenders")
+        
+        # Save to database
+        saved_count = 0
+        for tender_data in final_tenders:
+            try:
+                # Remove scoring fields before saving
+                tender_data.pop('relevance_score', None)
+                tender_data.pop('search_strategy', None)
+                tender_data.pop('search_query', None)
+                
+                tender = Tender(**tender_data)
+                self.db.add(tender)
+                saved_count += 1
+            except Exception as e:
+                logger.error(f"Error saving tender {tender_data.get('tender_id', 'unknown')}: {e}")
+                continue
+        
+        try:
+            self.db.commit()
+            logger.info(f"Successfully saved {saved_count} tenders to database")
+        except Exception as e:
+            logger.error(f"Error committing to database: {e}")
+            self.db.rollback()
+        
+        return final_tenders
+
 # FastAPI app setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1021,8 +1436,11 @@ async def lifespan(app: FastAPI):
     logger.info("Starting procurement scanner...")
     
     # Wait for Selenium Grid to be ready
-    if not selenium_manager.wait_for_grid_ready():
-        logger.error("Selenium Grid failed to start, but continuing...")
+    if selenium_manager is not None:
+        if not selenium_manager.wait_for_grid_ready():
+            logger.error("Selenium Grid failed to start, but continuing...")
+    else:
+        logger.error("selenium_manager not available, skipping Selenium Grid check")
     
     yield
     
@@ -1140,78 +1558,20 @@ async def trigger_scan(background_tasks: BackgroundTasks):
     return {"message": "Scan initiated"}
 
 async def scan_all_portals():
-    """Scan all portals and save results"""
-    scanner = ProcurementScanner()
-    matcher = TenderMatcher()
-    
-    # Get all portal IDs from PORTAL_CONFIGS
-    portal_ids = list(PORTAL_CONFIGS.keys())
-    
-    total_found = 0
-    new_tenders = 0
-    updated_tenders = 0
-    
-    # Scan all configured portals
-    for portal_id in portal_ids:
-        try:
-            config = PORTAL_CONFIGS[portal_id]
-            logger.info(f"Scanning {config['name']} ({portal_id})...")
-            
-            # Get the appropriate scan method based on portal type
-            if config['type'] == 'api':
-                # API-based portals
-                if portal_id == 'canadabuys':
-                    tenders = await scanner.scan_canadabuys()
-                else:
-                    logger.warning(f"No API scanner implemented for {portal_id}")
-                    continue
-            elif config['type'] == 'web':
-                # Web-based portals
-                if portal_id == 'merx':
-                    tenders = await scanner.scan_merx()
-                elif portal_id == 'bcbid':
-                    tenders = await scanner.scan_bcbid()
-                elif portal_id == 'seao':
-                    tenders = await scanner.scan_seao_web()
-                elif portal_id == 'biddingo':
-                    tenders = await scanner.scan_biddingo(config['name'], config)
-                else:
-                    logger.warning(f"No web scanner implemented for {portal_id}")
-                    continue
-            elif config['type'] == 'bidsandtenders':
-                # Bids&Tenders platform portals
-                search_url = config.get('search_url', 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all')
-                tenders = await scanner.scan_bidsandtenders_portal(config['name'], search_url)
-            else:
-                logger.warning(f"Unknown portal type '{config['type']}' for {portal_id}")
-                continue
-            
-            if tenders and isinstance(tenders, list):
-                # Process tenders
-                db = SessionLocal()
-                try:
-                    for tender_data in tenders:
-                        tender_data['matching_courses'] = matcher.match_courses(tender_data)
-                        tender_data['priority'] = matcher.calculate_priority(tender_data)
-                        
-                        was_new = save_tender_to_db(db, tender_data)
-                        if was_new:
-                            new_tenders += 1
-                        else:
-                            updated_tenders += 1
-                    
-                    total_found += len(tenders)
-                    logger.info(f"Processed {len(tenders)} tenders from {config['name']}")
-                    
-                finally:
-                    db.close()
-            else:
-                logger.info(f"No tenders found from {config['name']}")
-    
-        except Exception as e:
-            logger.error(f"Error scanning {portal_id}: {e}")
-    
-    logger.info(f"Scan complete. Found {total_found} tenders. New: {new_tenders}, Updated: {updated_tenders}")
+    """Enhanced scan using the new multi-strategy approach"""
+    try:
+        scanner = ProcurementScanner()
+        logger.info("Starting enhanced procurement scan with multiple strategies")
+        
+        # Use the new enhanced scan method
+        tenders = await scanner.scan()
+        
+        logger.info(f"Enhanced scan complete: {len(tenders)} tenders found")
+        return tenders
+        
+    except Exception as e:
+        logger.error(f"Error during enhanced scan: {e}")
+        return []
 
 @app.get("/health")
 async def health_check():

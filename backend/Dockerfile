@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     libpq-dev \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -26,5 +27,5 @@ USER scanner
 ENV PYTHONUNBUFFERED=1
 ENV SELENIUM_GRID_ENABLED=true
 
-# Run the application
+# Run the application directly
 CMD ["python", "main.py"]

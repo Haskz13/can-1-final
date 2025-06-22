@@ -9,6 +9,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import pandas as pd
+import asyncio
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +108,8 @@ class ProvincialScrapers:
                         
                         # Get link if available
                         link = cells[1].find('a')
-                        if link:
-                            tender['tender_url'] = 'https://vendor.purchasingconnection.ca/' + link.get('href', '')
+                        if link and link.get('href'):
+                            tender['tender_url'] = 'https://vendor.purchasingconnection.ca/' + str(link.get('href', ''))
                             
                         tenders.append(tender)
                         
@@ -135,16 +139,20 @@ class ProvincialScrapers:
             results = soup.find_all('div', class_='tender-result')
             
             for result in results[:30]:
+                org_elem = result.find('span', class_='org')
+                organization = org_elem.text.strip() if org_elem and hasattr(org_elem, 'text') and org_elem.text else 'Saskatchewan Government'
+                closing_elem = result.find('span', class_='closing')
+                closing_date = parse_date(closing_elem.text.strip() if closing_elem and hasattr(closing_elem, 'text') and closing_elem.text else '')
                 tender = {
                     'tender_id': result.get('data-tender-id', ''),
-                    'title': result.find('h3').text.strip() if result.find('h3') else '',
-                    'organization': result.find('span', class_='org').text.strip() if result.find('span', class_='org') else 'Saskatchewan Government',
+                    'title': result.find('h3').text.strip() if result.find('h3') and hasattr(result.find('h3'), 'text') and result.find('h3').text else '',
+                    'organization': organization,
                     'portal': 'SaskTenders',
                     'value': 0,
-                    'closing_date': parse_date(result.find('span', class_='closing').text.strip() if result.find('span', class_='closing') else ''),
+                    'closing_date': closing_date,
                     'posted_date': datetime.utcnow(),
                     'location': 'Saskatchewan',
-                    'tender_url': 'https://sasktenders.ca' + result.find('a')['href'] if result.find('a') else '',
+                    'tender_url': 'https://sasktenders.ca' + str(result.find('a').get('href', '')) if result.find('a') and result.find('a').get('href') else '',
                     'description': '',
                     'categories': [],
                     'keywords': []
@@ -843,3 +851,1699 @@ class HealthEducationScrapers:
             logger.error(f"Error scanning Ontario Health: {e}")
             
         return tenders
+
+class MERXScraper:
+    """Enhanced MERX scraper with multiple search strategies"""
+    
+    def __init__(self, username=None, password=None):
+        self.base_url = "https://www.merx.com"
+        self.search_url = "https://www.merx.com/public/solicitations/open?"
+        self.login_url = "https://www.merx.com/login"
+        self.username = username
+        self.password = password
+        self.driver = None
+        self.is_logged_in = False
+        
+    async def search(self, query, max_pages=5):
+        """Enhanced search with multiple strategies and pagination"""
+        logger.info(f"Starting enhanced MERX search for: {query}")
+        
+        if not self.driver:
+            self.driver = await self._setup_driver()
+        
+        all_tenders = []
+        
+        try:
+            # --- Format query for MERX: Use AND between keywords ---
+            if isinstance(query, (list, tuple)):
+                query_str = ' '.join(query)
+            else:
+                query_str = str(query)
+            
+            # For MERX: Use AND between keywords for multi-keyword search
+            if ' ' in query_str and ' AND ' not in query_str.upper():
+                keywords = query_str.split()
+                query_str = ' AND '.join(keywords)
+            logger.info(f"Using MERX search query: {query_str}")
+            
+            # Navigate to MERX search page
+            search_url = "https://www.merx.com/gov/tender-opportunities"
+            self.driver.get(search_url)
+            await asyncio.sleep(3)
+            
+            # Debug: Log the current page title and URL
+            logger.info(f"Current page: {self.driver.title}")
+            logger.info(f"Current URL: {self.driver.current_url}")
+            
+            # Handle cookie consent
+            await self._handle_cookie_consent()
+            
+            # Try to login if credentials provided
+            if self.username and self.password:
+                logger.info("Attempting to login to MERX")
+                try:
+                    await self._login()
+                except Exception as e:
+                    logger.error(f"Error during login: {e}")
+                    logger.warning("Continuing with public access")
+            
+            # Check if we're on a login page or 404
+            if "login" in self.driver.title.lower() or "error" in self.driver.title.lower():
+                logger.warning("Redirected to login page or error page - trying alternative URL")
+                alternative_url = "https://www.merx.com/gov/tenders"
+                self.driver.get(alternative_url)
+                await asyncio.sleep(3)
+                logger.info(f"Alternative page: {self.driver.title}")
+                logger.info(f"Alternative URL: {self.driver.current_url}")
+            
+            # Try to find search input field
+            search_input = None
+            search_selectors = [
+                "input[name='search']",
+                "input[placeholder*='Search']",
+                "input[type='search']",
+                "input[aria-label*='Search']",
+                "#search",
+                ".search-input",
+                "input[class*='search']",
+                "input[data-testid*='search']",
+                "input[name='keywords']",
+                "input[name='query']",
+                "input[name='q']",
+                "input[placeholder*='keyword']",
+                "input[placeholder*='find']",
+                "input[placeholder*='tender']",
+                "input[placeholder*='opportunity']"
+            ]
+            
+            for selector in search_selectors:
+                try:
+                    search_input = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if search_input.is_displayed() and search_input.is_enabled():
+                        logger.info(f"Found search input with selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not search_input:
+                # Try to find any input field that might be for search
+                all_inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input")
+                logger.info(f"Found {len(all_inputs)} input elements on the page")
+                for i, inp in enumerate(all_inputs[:5]):  # Log first 5 inputs
+                    try:
+                        placeholder = inp.get_attribute('placeholder') or 'None'
+                        name = inp.get_attribute('name') or 'None'
+                        input_type = inp.get_attribute('type') or 'None'
+                        logger.info(f"Input {i}: type={input_type}, name={name}, placeholder={placeholder}")
+                    except:
+                        pass
+                
+                logger.error("Error during MERX search: Could not find search input field on MERX")
+                logger.info("MERX search complete: 0 total tenders found")
+                return all_tenders
+            
+            # Clear and enter search query
+            try:
+                search_input.clear()
+                search_input.send_keys(query_str)
+                await asyncio.sleep(1)
+                
+                # Try multiple submit button selectors
+                search_button = None
+                button_selectors = [
+                    "button[type='submit']",
+                    "button[aria-label*='Search']",
+                    ".search-button",
+                    "button[class*='search']",
+                    "input[type='submit']",
+                    ".btn-search",
+                    "button:contains('Search')",
+                    ".search-submit",
+                    "button[data-testid*='search']",
+                    "button[class*='btn']"
+                ]
+                
+                for selector in button_selectors:
+                    try:
+                        search_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if search_button.is_displayed() and search_button.is_enabled():
+                            logger.info(f"Found search button with selector: {selector}")
+                            break
+                    except:
+                        continue
+                
+                if not search_button:
+                    # Try pressing Enter on the search input
+                    from selenium.webdriver.common.keys import Keys
+                    search_input.send_keys(Keys.RETURN)
+                    logger.info("Submitted search using Enter key")
+                else:
+                    search_button.click()
+                    logger.info("Submitted search using search button")
+                
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                logger.warning(f"Could not interact with search input: {e}")
+                logger.info("MERX search complete: 0 total tenders found")
+                return all_tenders
+            
+            # Process multiple pages
+            for page in range(1, max_pages + 1):
+                logger.info(f"Processing MERX page {page} for query: {query_str}")
+                
+                # Wait for results to load
+                await asyncio.sleep(3)
+                
+                # Extract tenders from current page
+                page_tenders = await self._extract_tenders_from_page()
+                all_tenders.extend(page_tenders)
+                
+                logger.info(f"Found {len(page_tenders)} tenders on page {page}")
+                
+                # Try to go to next page
+                if page < max_pages:
+                    try:
+                        next_selectors = [
+                            "a[aria-label*='Next']",
+                            ".next-page",
+                            ".pagination-next",
+                            "a[rel='next']",
+                            "a:contains('Next')",
+                            "button[aria-label*='Next']",
+                            ".next",
+                            "[class*='next']",
+                            "a[href*='page']",
+                            "a[href*='p=']"
+                        ]
+                        
+                        next_button = None
+                        for selector in next_selectors:
+                            try:
+                                next_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                                if next_button.is_displayed() and next_button.is_enabled():
+                                    break
+                            except:
+                                continue
+                        
+                        if next_button and 'disabled' not in next_button.get_attribute('class'):
+                            next_button.click()
+                            await asyncio.sleep(2)
+                        else:
+                            logger.info("Reached last page or no next button found")
+                            break
+                    except Exception as e:
+                        logger.info(f"No more pages available: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Error during MERX search: {e}")
+        
+        logger.info(f"MERX search complete: {len(all_tenders)} total tenders found")
+        return all_tenders
+    
+    async def _scrape_all_open_solicitations(self, max_pages=5, query=""):
+        """Scrape all open solicitations and filter by relevance"""
+        all_tenders = []
+        
+        try:
+            # Process multiple pages of open solicitations
+            for page in range(1, max_pages + 1):
+                logger.info(f"Processing MERX page {page} for all open solicitations")
+                
+                # Wait for results to load
+                await asyncio.sleep(3)
+                
+                # Extract tenders from current page
+                page_tenders = await self._extract_tenders_from_page()
+                
+                # Filter by relevance if query provided
+                if query:
+                    relevant_tenders = []
+                    for tender in page_tenders:
+                        relevance_score = self._calculate_relevance(tender, query)
+                        if relevance_score > 0.3:  # Threshold for relevance
+                            tender['relevance_score'] = relevance_score
+                            relevant_tenders.append(tender)
+                    page_tenders = relevant_tenders
+                
+                all_tenders.extend(page_tenders)
+                
+                logger.info(f"Found {len(page_tenders)} relevant tenders on page {page}")
+                
+                # Try to go to next page
+                if page < max_pages:
+                    try:
+                        next_selectors = [
+                            "button[aria-label*='Next']",
+                            "a[aria-label*='Next']",
+                            ".next-page",
+                            ".pagination-next",
+                            "a[rel='next']",
+                            "button:contains('Next')",
+                            "a:contains('Next')",
+                            "a[href*='page']",
+                            ".pagination a[href*='page']",
+                            "[class*='next']",
+                            "a[href*='p=']"
+                        ]
+                        
+                        next_button = None
+                        for selector in next_selectors:
+                            try:
+                                next_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                                if next_button.is_displayed() and next_button.is_enabled():
+                                    break
+                            except:
+                                continue
+                        
+                        if next_button and 'disabled' not in next_button.get_attribute('class'):
+                            next_button.click()
+                            await asyncio.sleep(2)
+                        else:
+                            logger.info("Reached last page or no next button found")
+                            break
+                    except Exception as e:
+                        logger.info(f"No more pages available: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Error scraping open solicitations: {e}")
+        
+        return all_tenders
+    
+    def _calculate_relevance(self, tender, query):
+        """Calculate relevance score for a tender based on query"""
+        query_terms = query.lower().split()
+        title = tender.get('title', '').lower()
+        description = tender.get('description', '').lower()
+        
+        score = 0
+        for term in query_terms:
+            if term in title:
+                score += 0.5
+            if term in description:
+                score += 0.3
+            # Check for partial matches
+            if any(term in word for word in title.split()):
+                score += 0.2
+            if any(term in word for word in description.split()):
+                score += 0.1
+        
+        return min(score, 1.0)  # Cap at 1.0
+    
+    async def _setup_driver(self):
+        """Setup Selenium WebDriver with enhanced configuration"""
+        try:
+            from selenium_utils import get_driver
+            driver = get_driver()
+            
+            # Set page load timeout
+            driver.set_page_load_timeout(30)
+            
+            # Set window size for better compatibility
+            driver.set_window_size(1920, 1080)
+            
+            logger.info("Selenium WebDriver setup complete")
+            return driver
+            
+        except Exception as e:
+            logger.error(f"Error setting up WebDriver: {e}")
+            raise
+    
+    async def _handle_cookie_consent(self):
+        """Handle cookie consent popups"""
+        try:
+            # Navigate to MERX first to trigger cookie consent
+            self.driver.get(self.base_url)
+            await asyncio.sleep(2)
+            
+            # Look for cookie consent buttons
+            cookie_selectors = [
+                "button[aria-label*='Accept']",
+                "button[aria-label*='Accept All']",
+                "button:contains('Accept')",
+                "button:contains('Accept All')",
+                "button:contains('I Accept')",
+                "button:contains('OK')",
+                "button:contains('Continue')",
+                ".cookie-accept",
+                ".cookie-consent-accept",
+                "[data-testid*='accept']",
+                "[data-testid*='cookie']",
+                ".cookie-banner button",
+                ".cookie-notice button",
+                "button[class*='accept']",
+                "button[class*='cookie']"
+            ]
+            
+            for selector in cookie_selectors:
+                try:
+                    buttons = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for button in buttons:
+                        if button.is_displayed() and button.is_enabled():
+                            logger.info(f"Found and clicking cookie consent button: {selector}")
+                            button.click()
+                            await asyncio.sleep(1)
+                            return
+                except:
+                    continue
+            
+            logger.info("No cookie consent popup found or already handled")
+            
+        except Exception as e:
+            logger.warning(f"Error handling cookie consent: {e}")
+    
+    async def _login(self):
+        """Login to MERX with provided credentials"""
+        try:
+            logger.info("Attempting to login to MERX")
+            
+            # Navigate to login page
+            self.driver.get(self.login_url)
+            await asyncio.sleep(3)
+            
+            # Handle cookie consent before login
+            await self._handle_cookie_consent()
+            
+            # Find username field
+            username_selectors = [
+                "input[name='j_username']",
+                "input[name='username']",
+                "input[type='email']",
+                "input[placeholder*='Username']",
+                "input[placeholder*='Email']",
+                "#username",
+                "#email"
+            ]
+            
+            username_field = None
+            for selector in username_selectors:
+                try:
+                    username_field = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if username_field.is_displayed():
+                        break
+                except:
+                    continue
+            
+            if not username_field:
+                logger.error("Could not find username field")
+                return
+            
+            # Find password field
+            password_selectors = [
+                "input[name='j_password']",
+                "input[name='password']",
+                "input[type='password']",
+                "input[placeholder*='Password']",
+                "#password"
+            ]
+            
+            password_field = None
+            for selector in password_selectors:
+                try:
+                    password_field = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if password_field.is_displayed():
+                        break
+                except:
+                    continue
+            
+            if not password_field:
+                logger.error("Could not find password field")
+                return
+            
+            # Enter credentials
+            username_field.clear()
+            username_field.send_keys(self.username)
+            await asyncio.sleep(1)
+            
+            password_field.clear()
+            password_field.send_keys(self.password)
+            await asyncio.sleep(1)
+            
+            # Find and click login button
+            login_selectors = [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button:contains('Login')",
+                "button:contains('Sign In')",
+                "button:contains('Log In')",
+                ".login-button",
+                ".signin-button",
+                "[data-testid*='login']",
+                "[data-testid*='signin']"
+            ]
+            
+            login_button = None
+            for selector in login_selectors:
+                try:
+                    login_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if login_button.is_displayed() and login_button.is_enabled():
+                        break
+                except:
+                    continue
+            
+            if not login_button:
+                logger.error("Could not find login button")
+                return
+            
+            # Click login button
+            login_button.click()
+            await asyncio.sleep(3)
+            
+            # Check if login was successful
+            if "login" not in self.driver.title.lower() and "sign in" not in self.driver.title.lower():
+                self.is_logged_in = True
+                logger.info("Successfully logged in to MERX")
+            else:
+                logger.warning("Login may have failed - continuing with public access")
+            
+        except Exception as e:
+            logger.error(f"Error during login: {e}")
+            logger.warning("Continuing with public access")
+    
+    async def _extract_tenders_from_page(self):
+        """Extract tenders from current page with enhanced parsing for MERX structure"""
+        tenders = []
+        
+        try:
+            # Wait for results to load - MERX shows results in a table format
+            result_selectors = [
+                "table",  # MERX uses tables for results
+                ".results-table",
+                "[class*='result']",
+                "[class*='tender']",
+                "[class*='opportunity']",
+                "[class*='solicitation']"
+            ]
+            
+            results_found = False
+            for selector in result_selectors:
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    logger.info(f"Found results container with selector: {selector}")
+                    results_found = True
+                    break
+                except:
+                    continue
+            
+            if not results_found:
+                # Wait for any content to load
+                await asyncio.sleep(5)
+                logger.info("No specific results container found, proceeding with general search")
+            
+            # Find all tender rows - MERX uses table rows for tenders
+            tender_selectors = [
+                "tr",  # Table rows for MERX
+                "tr[data-testid*='tender']",
+                "tr[class*='tender']",
+                "tr[class*='opportunity']",
+                "tr[class*='solicitation']",
+                ".tender-row",
+                ".opportunity-row",
+                ".solicitation-row",
+                "[class*='tender']",
+                "[class*='opportunity']",
+                "[class*='bid']",
+                "article",
+                ".card",
+                ".item"
+            ]
+            
+            tender_cards = []
+            for selector in tender_selectors:
+                try:
+                    cards = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if cards:
+                        logger.info(f"Found {len(cards)} tender cards with selector: {selector}")
+                        tender_cards = cards
+                        break
+                except:
+                    continue
+            
+            if not tender_cards:
+                # Fallback: look for any clickable elements that might be tenders
+                all_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='tender'], a[href*='opportunity'], a[href*='bid'], a[href*='solicitation']")
+                logger.info(f"Fallback: found {len(all_links)} potential tender links")
+                tender_cards = all_links
+            
+            for card in tender_cards:
+                try:
+                    tender_data = await self._parse_tender_card(card)
+                    if tender_data:
+                        tenders.append(tender_data)
+                except Exception as e:
+                    logger.warning(f"Error parsing tender card: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error extracting tenders from page: {e}")
+        
+        return tenders
+    
+    async def _parse_tender_card(self, card):
+        """Enhanced tender card parsing with better field extraction"""
+        try:
+            # Extract title and link with multiple selectors
+            title_selectors = [
+                "h3 a", ".tender-title a", "h2 a", "h1 a",
+                ".title a", ".name a", ".heading a",
+                "a[href*='tender']", "a[href*='opportunity']", "a[href*='bid']",
+                "a", ".title", ".name", ".heading"
+            ]
+            
+            title_element = None
+            title = ""
+            tender_url = ""
+            
+            for selector in title_selectors:
+                try:
+                    title_element = card.find_element(By.CSS_SELECTOR, selector)
+                    if title_element.is_displayed():
+                        title = title_element.text.strip()
+                        tender_url = title_element.get_attribute('href') or ""
+                        if title and tender_url:
+                            logger.info(f"Found title with selector: {selector}")
+                            break
+                except:
+                    continue
+            
+            if not title:
+                # Fallback: get any text that might be a title
+                title = card.text[:200].strip()  # First 200 chars as title
+                tender_url = card.get_attribute('href') or ""
+            
+            # Extract tender ID from URL or text
+            tender_id = self._extract_tender_id(tender_url, title)
+            
+            # Extract organization with multiple selectors
+            org_selectors = [
+                ".organization", ".buyer-name", ".buyer", ".department",
+                ".agency", ".client", ".company", ".org",
+                "[class*='organization']", "[class*='buyer']", "[class*='department']"
+            ]
+            
+            organization = ""
+            for selector in org_selectors:
+                try:
+                    org_element = card.find_element(By.CSS_SELECTOR, selector)
+                    organization = org_element.text.strip()
+                    if organization:
+                        break
+                except:
+                    continue
+            
+            # Extract location with multiple selectors
+            location_selectors = [
+                ".location", ".province", ".region", ".area",
+                ".city", ".state", ".territory",
+                "[class*='location']", "[class*='province']", "[class*='region']"
+            ]
+            
+            location = ""
+            for selector in location_selectors:
+                try:
+                    location_element = card.find_element(By.CSS_SELECTOR, selector)
+                    location = location_element.text.strip()
+                    if location:
+                        break
+                except:
+                    continue
+            
+            # Extract closing date
+            closing_date = await self._extract_date(card, ".closing-date, .deadline, .due-date, [class*='closing'], [class*='deadline']")
+            
+            # Extract posted date
+            posted_date = await self._extract_date(card, ".posted-date, .published-date, .issue-date, [class*='posted'], [class*='published']")
+            
+            # Extract value (if available)
+            value = await self._extract_value(card)
+            
+            # Extract description
+            description = await self._extract_description(card)
+            
+            # Determine priority based on content analysis
+            priority = self._determine_priority(title, description)
+            
+            # Extract matching courses
+            matching_courses = self._extract_matching_courses(title, description)
+            
+            # Extract categories
+            categories = await self._extract_categories(card)
+            
+            # Extract keywords
+            keywords = self._extract_keywords(title, description)
+            
+            # Extract contact info
+            contact_email, contact_phone = await self._extract_contact_info(card)
+            
+            return {
+                'tender_id': tender_id,
+                'title': title,
+                'organization': organization,
+                'portal': 'CanadaBuys',
+                'value': value,
+                'closing_date': closing_date,
+                'posted_date': posted_date,
+                'description': description,
+                'location': location,
+                'categories': categories,
+                'keywords': keywords,
+                'contact_email': contact_email,
+                'contact_phone': contact_phone,
+                'tender_url': tender_url,
+                'documents_url': None,
+                'priority': priority,
+                'matching_courses': matching_courses
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error parsing tender card: {e}")
+            return None
+    
+    def _extract_tender_id(self, url, title):
+        """Extract tender ID from URL or title"""
+        if url:
+            # Try to extract from URL
+            import re
+            match = re.search(r'/(\d+)(?:/|$)', url)
+            if match:
+                return match.group(1)
+        
+        # Try to extract from title
+        import re
+        match = re.search(r'#(\d+)', title)
+        if match:
+            return match.group(1)
+        
+        # Generate ID from title hash
+        import hashlib
+        return hashlib.md5(title.encode()).hexdigest()[:8]
+    
+    async def _extract_date(self, card, selector):
+        """Extract date from card element"""
+        try:
+            date_element = card.find_element(By.CSS_SELECTOR, selector)
+            date_text = date_element.text
+            return self._parse_date(date_text)
+        except:
+            return None
+    
+    def _parse_date(self, date_text):
+        """Parse various date formats"""
+        if not date_text:
+            return None
+        
+        try:
+            # Common date formats
+            from datetime import datetime
+            formats = [
+                '%B %d, %Y',
+                '%b %d, %Y',
+                '%Y-%m-%d',
+                '%m/%d/%Y',
+                '%d/%m/%Y'
+            ]
+            
+            for fmt in formats:
+                try:
+                    return datetime.strptime(date_text.strip(), fmt).isoformat()
+                except:
+                    continue
+            
+            return None
+        except:
+            return None
+    
+    async def _extract_value(self, card):
+        """Extract tender value"""
+        try:
+            value_element = card.find_element(By.CSS_SELECTOR, ".value, .budget, .amount")
+            value_text = value_element.text
+            return self._parse_value(value_text)
+        except:
+            return 0
+    
+    def _parse_value(self, value_text):
+        """Parse value from text"""
+        if not value_text:
+            return 0
+        
+        try:
+            import re
+            # Extract numbers and handle currency
+            numbers = re.findall(r'[\d,]+', value_text.replace(',', ''))
+            if numbers:
+                value = float(numbers[0])
+                
+                # Handle multipliers (K, M, B)
+                if 'K' in value_text.upper():
+                    value *= 1000
+                elif 'M' in value_text.upper():
+                    value *= 1000000
+                elif 'B' in value_text.upper():
+                    value *= 1000000000
+                
+                return int(value)
+        except:
+            pass
+        
+        return 0
+    
+    async def _extract_description(self, card):
+        """Extract tender description"""
+        try:
+            desc_element = card.find_element(By.CSS_SELECTOR, ".description, .summary, .details")
+            return desc_element.text
+        except:
+            return ""
+    
+    def _determine_priority(self, title, description):
+        """Determine tender priority based on content analysis"""
+        text = f"{title} {description}".lower()
+        
+        # High priority indicators
+        high_priority_terms = [
+            'training', 'professional development', 'certification',
+            'AWS', 'Azure', 'cybersecurity', 'project management',
+            'agile', 'scrum', 'leadership', 'coaching'
+        ]
+        
+        # Medium priority indicators
+        medium_priority_terms = [
+            'consulting', 'implementation', 'change management',
+            'development', 'education', 'learning'
+        ]
+        
+        high_count = sum(1 for term in high_priority_terms if term in text)
+        medium_count = sum(1 for term in medium_priority_terms if term in text)
+        
+        if high_count >= 2:
+            return 'high'
+        elif high_count >= 1 or medium_count >= 2:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _extract_matching_courses(self, title, description):
+        """Extract matching TKA courses from content"""
+        text = f"{title} {description}".lower()
+        matching_courses = []
+        
+        # Course mappings
+        course_mappings = {
+            'aws': 'AWS Training',
+            'azure': 'Azure Training',
+            'cloud': 'Cloud Computing',
+            'cybersecurity': 'Cybersecurity Training',
+            'cissp': 'CISSP Certification',
+            'project management': 'Project Management',
+            'pmp': 'PMP Certification',
+            'prince2': 'PRINCE2 Certification',
+            'agile': 'Agile Training',
+            'scrum': 'Scrum Training',
+            'leadership': 'Leadership Development',
+            'itil': 'ITIL Training',
+            'devops': 'DevOps Training',
+            'data analytics': 'Data Analytics',
+            'business intelligence': 'Business Intelligence',
+            'change management': 'Change Management',
+            'coaching': 'Executive Coaching'
+        }
+        
+        for keyword, course in course_mappings.items():
+            if keyword in text:
+                matching_courses.append(course)
+        
+        return matching_courses
+    
+    async def _extract_categories(self, card):
+        """Extract tender categories"""
+        try:
+            category_elements = card.find_elements(By.CSS_SELECTOR, ".category, .tag, .classification")
+            categories = []
+            for element in category_elements:
+                category = element.text
+                if category:
+                    categories.append(category.strip())
+            return categories
+        except:
+            return []
+    
+    def _extract_keywords(self, title, description):
+        """Extract keywords from title and description"""
+        text = f"{title} {description}".lower()
+        keywords = []
+        
+        # Extract meaningful keywords
+        import re
+        words = re.findall(r'\b\w{4,}\b', text)
+        
+        # Filter for relevant keywords
+        relevant_words = [
+            'training', 'development', 'consulting', 'implementation',
+            'management', 'leadership', 'technology', 'digital',
+            'transformation', 'change', 'process', 'system'
+        ]
+        
+        for word in words:
+            if word in relevant_words and word not in keywords:
+                keywords.append(word)
+        
+        return keywords[:10]  # Limit to 10 keywords
+    
+    async def _extract_contact_info(self, card):
+        """Extract contact information"""
+        try:
+            # Look for contact elements
+            contact_elements = card.find_elements(By.CSS_SELECTOR, ".contact, .contact-info, .buyer-contact")
+            
+            email = None
+            phone = None
+            
+            for element in contact_elements:
+                text = element.text
+                
+                # Extract email
+                import re
+                email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+                if email_match:
+                    email = email_match.group(0)
+                
+                # Extract phone
+                phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text)
+                if phone_match:
+                    phone = phone_match.group(0)
+            
+            return email, phone
+        except:
+            return None, None
+
+class CanadaBuysScraper:
+    """Enhanced CanadaBuys scraper with multiple search strategies"""
+    
+    def __init__(self):
+        self.base_url = "https://canadabuys.canada.ca"
+        self.search_url = "https://canadabuys.canada.ca/en/tender-opportunities?search_filter=&status%5B87%5D=87&record_per_page=50&current_tab=t&words="
+        self.driver = None
+        
+    async def search(self, query, max_pages=5):
+        logger.info(f"[DEBUG] CanadaBuysScraper.search called with query: {query}")
+        """Enhanced search with multiple strategies and pagination"""
+        logger.info(f"Starting enhanced CanadaBuys search for: {query}")
+        
+        if not self.driver:
+            self.driver = await self._setup_driver()
+        
+        all_tenders = []
+        
+        try:
+            # --- 1. Use quoted multi-keyword search ---
+            if isinstance(query, (list, tuple)):
+                query_str = ' '.join(query)
+            else:
+                query_str = str(query)
+            if ' ' in query_str and not (query_str.startswith('"') and query_str.endswith('"')):
+                query_str = f'"{query_str.strip()}"'
+            logger.info(f"Using quoted search query: {query_str}")
+
+            # Navigate to search page with query parameters
+            search_url_with_query = f"{self.search_url}{query_str}"
+            self.driver.get(search_url_with_query)
+            await asyncio.sleep(3)
+            
+            # Debug: Log the current page title and URL
+            logger.info(f"Current page: {self.driver.title}")
+            logger.info(f"Current URL: {self.driver.current_url}")
+            
+            # Handle cookie consent if present
+            try:
+                accept_selectors = [
+                    "button[aria-label*='Accept']",
+                    ".accept-cookies", 
+                    ".cookie-accept",
+                    "button:contains('Accept')",
+                    "button:contains('OK')",
+                    ".btn-accept",
+                    "button[data-testid*='accept']",
+                    "button[class*='accept']"
+                ]
+                for selector in accept_selectors:
+                    try:
+                        accept_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if accept_button.is_displayed():
+                            accept_button.click()
+                            await asyncio.sleep(1)
+                            break
+                    except:
+                        continue
+            except:
+                pass
+            
+            # Try multiple search input selectors for CanadaBuys
+            search_input = None
+            search_selectors = [
+                "input[placeholder*='Search']",
+                "input[name='search']",
+                "input[type='search']",
+                "input[aria-label*='Search']",
+                "#search",
+                ".search-input",
+                "input[class*='search']",
+                "input[data-testid*='search']",
+                "input[name='keywords']",
+                "input[name='query']",
+                "input[name='q']",
+                "input[placeholder*='keyword']",
+                "input[placeholder*='find']",
+                "input[placeholder*='tender']",
+                "input[placeholder*='opportunity']",
+                "input[name='words']"
+            ]
+            
+            for selector in search_selectors:
+                try:
+                    search_input = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if search_input.is_displayed() and search_input.is_enabled():
+                        logger.info(f"Found search input with selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not search_input:
+                # Try to find any input field that might be for search
+                all_inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input")
+                logger.info(f"Found {len(all_inputs)} input elements on the page")
+                for i, inp in enumerate(all_inputs[:5]):  # Log first 5 inputs
+                    try:
+                        placeholder = inp.get_attribute('placeholder') or 'None'
+                        name = inp.get_attribute('name') or 'None'
+                        input_type = inp.get_attribute('type') or 'None'
+                        logger.info(f"Input {i}: type={input_type}, name={name}, placeholder={placeholder}")
+                    except:
+                        pass
+                
+                for inp in all_inputs:
+                    if inp.is_displayed() and inp.is_enabled():
+                        placeholder = inp.get_attribute('placeholder') or ''
+                        name = inp.get_attribute('name') or ''
+                        if any(term in placeholder.lower() or term in name.lower() 
+                               for term in ['search', 'keyword', 'query', 'find', 'tender', 'opportunity', 'words']):
+                            search_input = inp
+                            logger.info(f"Found search input by analyzing attributes")
+                            break
+            
+            if not search_input:
+                logger.warning("Could not find search input field on CanadaBuys - scraping all opportunities")
+                return await self._scrape_all_opportunities(max_pages, query_str)
+            
+            # Clear and enter search query
+            try:
+                search_input.clear()
+                search_input.send_keys(query_str)
+                await asyncio.sleep(1)
+                
+                # Try multiple submit button selectors
+                search_button = None
+                button_selectors = [
+                    "button[type='submit']",
+                    "button[aria-label*='Search']",
+                    ".search-button",
+                    "button[class*='search']",
+                    "input[type='submit']",
+                    ".btn-search",
+                    "button:contains('Search')",
+                    ".search-submit",
+                    "button[data-testid*='search']",
+                    "button[class*='btn']"
+                ]
+                
+                for selector in button_selectors:
+                    try:
+                        search_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if search_button.is_displayed() and search_button.is_enabled():
+                            logger.info(f"Found search button with selector: {selector}")
+                            break
+                    except:
+                        continue
+                
+                if not search_button:
+                    # Try pressing Enter on the search input
+                    from selenium.webdriver.common.keys import Keys
+                    search_input.send_keys(Keys.RETURN)
+                    logger.info("Submitted search using Enter key")
+                else:
+                    search_button.click()
+                    logger.info("Submitted search using search button")
+                
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                logger.warning(f"Could not interact with search input: {e}")
+                return await self._scrape_all_opportunities(max_pages, query_str)
+
+            # --- 2. Set results per page to 200 ---
+            try:
+                # Try to find the results-per-page dropdown/button
+                per_page_selectors = [
+                    "select[name='record_per_page']",
+                    "#results-per-page",
+                    ".results-per-page select",
+                    "select[aria-label*='Results per page']",
+                    "select",
+                    "button[aria-label*='Results per page']",
+                    ".results-per-page button",
+                    "button:contains('Results per page')",
+                    "[data-testid*='results-per-page']"
+                ]
+                per_page_control = None
+                for selector in per_page_selectors:
+                    try:
+                        per_page_control = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if per_page_control.is_displayed() and per_page_control.is_enabled():
+                            logger.info(f"Found results-per-page control with selector: {selector}")
+                            break
+                    except:
+                        continue
+                if per_page_control:
+                    tag = per_page_control.tag_name.lower()
+                    if tag == 'select':
+                        from selenium.webdriver.support.ui import Select
+                        select = Select(per_page_control)
+                        select.select_by_value('200')
+                        logger.info("Set results per page to 200 via select dropdown")
+                    elif tag == 'button':
+                        per_page_control.click()
+                        await asyncio.sleep(1)
+                        # Try to find the 200 option in the dropdown
+                        option_selectors = [
+                            "li[data-value='200']",
+                            "button[data-value='200']",
+                            "li:contains('200')",
+                            "button:contains('200')",
+                            "option[value='200']",
+                            "[role='option'][data-value='200']"
+                        ]
+                        for opt_selector in option_selectors:
+                            try:
+                                option = self.driver.find_element(By.CSS_SELECTOR, opt_selector)
+                                if option.is_displayed() and option.is_enabled():
+                                    option.click()
+                                    logger.info("Set results per page to 200 via button dropdown")
+                                    break
+                            except:
+                                continue
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning("Could not find results-per-page control to set 200 per page")
+            except Exception as e:
+                logger.warning(f"Error setting results per page: {e}")
+            
+            # Process multiple pages
+            for page in range(1, max_pages + 1):
+                logger.info(f"Processing CanadaBuys page {page} for query: {query}")
+                
+                # Wait for results to load
+                await asyncio.sleep(3)
+                
+                # Extract tenders from current page
+                page_tenders = await self._extract_tenders_from_page()
+                all_tenders.extend(page_tenders)
+                
+                logger.info(f"Found {len(page_tenders)} tenders on page {page}")
+                
+                # Try to go to next page
+                if page < max_pages:
+                    try:
+                        next_selectors = [
+                            "a[aria-label*='Next']",
+                            ".next-page",
+                            ".pagination-next",
+                            "a[rel='next']",
+                            "a:contains('Next')",
+                            "button[aria-label*='Next']",
+                            ".next",
+                            "[class*='next']",
+                            "a[href*='page']",
+                            "a[href*='p=']"
+                        ]
+                        
+                        next_button = None
+                        for selector in next_selectors:
+                            try:
+                                next_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                                if next_button.is_displayed() and next_button.is_enabled():
+                                    break
+                            except:
+                                continue
+                        
+                        if next_button and 'disabled' not in next_button.get_attribute('class'):
+                            next_button.click()
+                            await asyncio.sleep(2)
+                        else:
+                            logger.info("Reached last page or no next button found")
+                            break
+                    except Exception as e:
+                        logger.info(f"No more pages available: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Error during CanadaBuys search: {e}")
+        
+        logger.info(f"CanadaBuys search complete: {len(all_tenders)} total tenders found")
+        return all_tenders
+    
+    async def _scrape_all_opportunities(self, max_pages=5, query=""):
+        """Scrape all opportunities and filter by relevance"""
+        all_tenders = []
+        
+        try:
+            # Process multiple pages of opportunities
+            for page in range(1, max_pages + 1):
+                logger.info(f"Processing CanadaBuys page {page} for all opportunities")
+                
+                # Wait for results to load
+                await asyncio.sleep(3)
+                
+                # Extract tenders from current page
+                page_tenders = await self._extract_tenders_from_page()
+                
+                # Filter by relevance if query provided
+                if query:
+                    relevant_tenders = []
+                    for tender in page_tenders:
+                        relevance_score = self._calculate_relevance(tender, query)
+                        if relevance_score > 0.3:  # Threshold for relevance
+                            tender['relevance_score'] = relevance_score
+                            relevant_tenders.append(tender)
+                    page_tenders = relevant_tenders
+                
+                all_tenders.extend(page_tenders)
+                
+                logger.info(f"Found {len(page_tenders)} relevant tenders on page {page}")
+                
+                # Try to go to next page
+                if page < max_pages:
+                    try:
+                        next_selectors = [
+                            "a[aria-label*='Next']",
+                            ".next-page",
+                            ".pagination-next",
+                            "a[rel='next']",
+                            "a:contains('Next')",
+                            "button[aria-label*='Next']",
+                            ".next",
+                            "[class*='next']",
+                            "a[href*='page']",
+                            "a[href*='p=']"
+                        ]
+                        
+                        next_button = None
+                        for selector in next_selectors:
+                            try:
+                                next_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                                if next_button.is_displayed() and next_button.is_enabled():
+                                    break
+                            except:
+                                continue
+                        
+                        if next_button and 'disabled' not in next_button.get_attribute('class'):
+                            next_button.click()
+                            await asyncio.sleep(2)
+                        else:
+                            logger.info("Reached last page or no next button found")
+                            break
+                    except Exception as e:
+                        logger.info(f"No more pages available: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Error scraping opportunities: {e}")
+        
+        return all_tenders
+    
+    def _calculate_relevance(self, tender, query):
+        """Calculate relevance score for a tender based on query"""
+        query_terms = query.lower().split()
+        title = tender.get('title', '').lower()
+        description = tender.get('description', '').lower()
+        
+        score = 0
+        for term in query_terms:
+            if term in title:
+                score += 0.5
+            if term in description:
+                score += 0.3
+            # Check for partial matches
+            if any(term in word for word in title.split()):
+                score += 0.2
+            if any(term in word for word in description.split()):
+                score += 0.1
+        
+        return min(score, 1.0)  # Cap at 1.0
+    
+    async def _setup_driver(self):
+        """Setup Selenium WebDriver with enhanced configuration"""
+        try:
+            from selenium_utils import get_driver
+            driver = get_driver()
+            
+            # Set page load timeout
+            driver.set_page_load_timeout(30)
+            
+            # Set window size for better compatibility
+            driver.set_window_size(1920, 1080)
+            
+            logger.info("Selenium WebDriver setup complete")
+            return driver
+            
+        except Exception as e:
+            logger.error(f"Error setting up WebDriver: {e}")
+            raise
+    
+    async def _extract_tenders_from_page(self):
+        """Extract tenders from current page with enhanced parsing for CanadaBuys structure"""
+        tenders = []
+        
+        try:
+            # Wait for results to load - CanadaBuys shows results in a list format
+            result_selectors = [
+                ".search-result",           # Common search result class
+                ".opportunity-item",        # Opportunity items
+                ".tender-result",           # Tender results
+                "article",                  # Article elements (common for listings)
+                ".result-item",             # Result items
+                "div[class*='result']",     # Any div with 'result' in class
+                "div[class*='opportunity']", # Any div with 'opportunity' in class
+                "a[href*='/tender-opportunities/']",  # Links to tender opportunities
+                ".tender-listing",          # Tender listings
+                ".opportunity-listing",     # Opportunity listings
+                "div[class*='listing']",    # Any listing div
+                "div[class*='item']"        # Any item div
+            ]
+            
+            results_found = False
+            for selector in result_selectors:
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    logger.info(f"Found results container with selector: {selector}")
+                    results_found = True
+                    break
+                except:
+                    continue
+            
+            if not results_found:
+                # Wait for any content to load
+                await asyncio.sleep(5)
+                logger.info("No specific results container found, proceeding with general search")
+            
+            # Find all tender cards - CanadaBuys uses various formats
+            tender_selectors = [
+                ".search-result",           # Common search result class
+                ".opportunity-item",        # Opportunity items
+                ".tender-result",           # Tender results
+                "article",                  # Article elements (common for listings)
+                ".result-item",             # Result items
+                "div[class*='result']",     # Any div with 'result' in class
+                "div[class*='opportunity']", # Any div with 'opportunity' in class
+                "a[href*='/tender-opportunities/']",  # Links to tender opportunities
+                ".tender-listing",          # Tender listings
+                ".opportunity-listing",     # Opportunity listings
+                "div[class*='listing']",    # Any listing div
+                "div[class*='item']",       # Any item div
+                "tr",                       # Table rows
+                "li"                        # List items
+            ]
+            
+            tender_cards = []
+            for selector in tender_selectors:
+                try:
+                    cards = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if cards:
+                        logger.info(f"Found {len(cards)} tender cards with selector: {selector}")
+                        tender_cards = cards
+                        break
+                except:
+                    continue
+            
+            if not tender_cards:
+                # Fallback: look for any clickable elements that might be tenders
+                all_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='tender'], a[href*='opportunity'], a[href*='bid'], a[href*='solicitation']")
+                logger.info(f"Fallback: found {len(all_links)} potential tender links")
+                tender_cards = all_links
+            
+            for card in tender_cards:
+                try:
+                    tender_data = await self._parse_tender_card(card)
+                    if tender_data:
+                        tenders.append(tender_data)
+                except Exception as e:
+                    logger.warning(f"Error parsing tender card: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error extracting tenders from page: {e}")
+        
+        return tenders
+    
+    async def _parse_tender_card(self, card):
+        """Enhanced tender card parsing with better field extraction"""
+        try:
+            # Extract title and link with multiple selectors
+            title_selectors = [
+                "h3 a", ".tender-title a", "h2 a", "h1 a",
+                ".title a", ".name a", ".heading a",
+                "a[href*='tender']", "a[href*='opportunity']", "a[href*='bid']",
+                "a", ".title", ".name", ".heading"
+            ]
+            
+            title_element = None
+            title = ""
+            tender_url = ""
+            
+            for selector in title_selectors:
+                try:
+                    title_element = card.find_element(By.CSS_SELECTOR, selector)
+                    if title_element.is_displayed():
+                        title = title_element.text.strip()
+                        tender_url = title_element.get_attribute('href') or ""
+                        if title and tender_url:
+                            logger.info(f"Found title with selector: {selector}")
+                            break
+                except:
+                    continue
+            
+            if not title:
+                # Fallback: get any text that might be a title
+                title = card.text[:200].strip()  # First 200 chars as title
+                tender_url = card.get_attribute('href') or ""
+            
+            # Extract tender ID from URL or text
+            tender_id = self._extract_tender_id(tender_url, title)
+            
+            # Extract organization with multiple selectors
+            org_selectors = [
+                ".organization", ".buyer-name", ".buyer", ".department",
+                ".agency", ".client", ".company", ".org",
+                "[class*='organization']", "[class*='buyer']", "[class*='department']"
+            ]
+            
+            organization = ""
+            for selector in org_selectors:
+                try:
+                    org_element = card.find_element(By.CSS_SELECTOR, selector)
+                    organization = org_element.text.strip()
+                    if organization:
+                        break
+                except:
+                    continue
+            
+            # Extract location with multiple selectors
+            location_selectors = [
+                ".location", ".province", ".region", ".area",
+                ".city", ".state", ".territory",
+                "[class*='location']", "[class*='province']", "[class*='region']"
+            ]
+            
+            location = ""
+            for selector in location_selectors:
+                try:
+                    location_element = card.find_element(By.CSS_SELECTOR, selector)
+                    location = location_element.text.strip()
+                    if location:
+                        break
+                except:
+                    continue
+            
+            # Extract closing date
+            closing_date = await self._extract_date(card, ".closing-date, .deadline, .due-date, [class*='closing'], [class*='deadline']")
+            
+            # Extract posted date
+            posted_date = await self._extract_date(card, ".posted-date, .published-date, .issue-date, [class*='posted'], [class*='published']")
+            
+            # Extract value (if available)
+            value = await self._extract_value(card)
+            
+            # Extract description
+            description = await self._extract_description(card)
+            
+            # Determine priority based on content analysis
+            priority = self._determine_priority(title, description)
+            
+            # Extract matching courses
+            matching_courses = self._extract_matching_courses(title, description)
+            
+            # Extract categories
+            categories = await self._extract_categories(card)
+            
+            # Extract keywords
+            keywords = self._extract_keywords(title, description)
+            
+            # Extract contact info
+            contact_email, contact_phone = await self._extract_contact_info(card)
+            
+            return {
+                'tender_id': tender_id,
+                'title': title,
+                'organization': organization,
+                'portal': 'CanadaBuys',
+                'value': value,
+                'closing_date': closing_date,
+                'posted_date': posted_date,
+                'description': description,
+                'location': location,
+                'categories': categories,
+                'keywords': keywords,
+                'contact_email': contact_email,
+                'contact_phone': contact_phone,
+                'tender_url': tender_url,
+                'documents_url': None,
+                'priority': priority,
+                'matching_courses': matching_courses
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error parsing tender card: {e}")
+            return None
+    
+    def _extract_tender_id(self, url, title):
+        """Extract tender ID from URL or title"""
+        if url:
+            # Try to extract from URL
+            import re
+            match = re.search(r'/(\d+)(?:/|$)', url)
+            if match:
+                return match.group(1)
+        
+        # Try to extract from title
+        import re
+        match = re.search(r'#(\d+)', title)
+        if match:
+            return match.group(1)
+        
+        # Generate ID from title hash
+        import hashlib
+        return hashlib.md5(title.encode()).hexdigest()[:8]
+    
+    async def _extract_date(self, card, selector):
+        """Extract date from card element"""
+        try:
+            date_element = card.find_element(By.CSS_SELECTOR, selector)
+            date_text = date_element.text
+            return self._parse_date(date_text)
+        except:
+            return None
+    
+    def _parse_date(self, date_text):
+        """Parse various date formats"""
+        if not date_text:
+            return None
+        
+        try:
+            # Common date formats
+            from datetime import datetime
+            formats = [
+                '%B %d, %Y',
+                '%b %d, %Y',
+                '%Y-%m-%d',
+                '%m/%d/%Y',
+                '%d/%m/%Y'
+            ]
+            
+            for fmt in formats:
+                try:
+                    return datetime.strptime(date_text.strip(), fmt).isoformat()
+                except:
+                    continue
+            
+            return None
+        except:
+            return None
+    
+    async def _extract_value(self, card):
+        """Extract tender value"""
+        try:
+            value_element = card.find_element(By.CSS_SELECTOR, ".value, .budget, .amount")
+            value_text = value_element.text
+            return self._parse_value(value_text)
+        except:
+            return 0
+    
+    def _parse_value(self, value_text):
+        """Parse value from text"""
+        if not value_text:
+            return 0
+        
+        try:
+            import re
+            # Extract numbers and handle currency
+            numbers = re.findall(r'[\d,]+', value_text.replace(',', ''))
+            if numbers:
+                value = float(numbers[0])
+                
+                # Handle multipliers (K, M, B)
+                if 'K' in value_text.upper():
+                    value *= 1000
+                elif 'M' in value_text.upper():
+                    value *= 1000000
+                elif 'B' in value_text.upper():
+                    value *= 1000000000
+                
+                return int(value)
+        except:
+            pass
+        
+        return 0
+    
+    async def _extract_description(self, card):
+        """Extract tender description"""
+        try:
+            desc_element = card.find_element(By.CSS_SELECTOR, ".description, .summary, .details")
+            return desc_element.text
+        except:
+            return ""
+    
+    def _determine_priority(self, title, description):
+        """Determine tender priority based on content analysis"""
+        text = f"{title} {description}".lower()
+        
+        # High priority indicators
+        high_priority_terms = [
+            'training', 'professional development', 'certification',
+            'AWS', 'Azure', 'cybersecurity', 'project management',
+            'agile', 'scrum', 'leadership', 'coaching'
+        ]
+        
+        # Medium priority indicators
+        medium_priority_terms = [
+            'consulting', 'implementation', 'change management',
+            'development', 'education', 'learning'
+        ]
+        
+        high_count = sum(1 for term in high_priority_terms if term in text)
+        medium_count = sum(1 for term in medium_priority_terms if term in text)
+        
+        if high_count >= 2:
+            return 'high'
+        elif high_count >= 1 or medium_count >= 2:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _extract_matching_courses(self, title, description):
+        """Extract matching TKA courses from content"""
+        text = f"{title} {description}".lower()
+        matching_courses = []
+        
+        # Course mappings
+        course_mappings = {
+            'aws': 'AWS Training',
+            'azure': 'Azure Training',
+            'cloud': 'Cloud Computing',
+            'cybersecurity': 'Cybersecurity Training',
+            'cissp': 'CISSP Certification',
+            'project management': 'Project Management',
+            'pmp': 'PMP Certification',
+            'prince2': 'PRINCE2 Certification',
+            'agile': 'Agile Training',
+            'scrum': 'Scrum Training',
+            'leadership': 'Leadership Development',
+            'itil': 'ITIL Training',
+            'devops': 'DevOps Training',
+            'data analytics': 'Data Analytics',
+            'business intelligence': 'Business Intelligence',
+            'change management': 'Change Management',
+            'coaching': 'Executive Coaching'
+        }
+        
+        for keyword, course in course_mappings.items():
+            if keyword in text:
+                matching_courses.append(course)
+        
+        return matching_courses
+    
+    async def _extract_categories(self, card):
+        """Extract tender categories"""
+        try:
+            category_elements = card.find_elements(By.CSS_SELECTOR, ".category, .tag, .classification")
+            categories = []
+            for element in category_elements:
+                category = element.text
+                if category:
+                    categories.append(category.strip())
+            return categories
+        except:
+            return []
+    
+    def _extract_keywords(self, title, description):
+        """Extract keywords from title and description"""
+        text = f"{title} {description}".lower()
+        keywords = []
+        
+        # Extract meaningful keywords
+        import re
+        words = re.findall(r'\b\w{4,}\b', text)
+        
+        # Filter for relevant keywords
+        relevant_words = [
+            'training', 'development', 'consulting', 'implementation',
+            'management', 'leadership', 'technology', 'digital',
+            'transformation', 'change', 'process', 'system'
+        ]
+        
+        for word in words:
+            if word in relevant_words and word not in keywords:
+                keywords.append(word)
+        
+        return keywords[:10]  # Limit to 10 keywords
+    
+    async def _extract_contact_info(self, card):
+        """Extract contact information"""
+        try:
+            # Look for contact elements
+            contact_elements = card.find_elements(By.CSS_SELECTOR, ".contact, .contact-info, .buyer-contact")
+            
+            email = None
+            phone = None
+            
+            for element in contact_elements:
+                text = element.text
+                
+                # Extract email
+                import re
+                email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+                if email_match:
+                    email = email_match.group(0)
+                
+                # Extract phone
+                phone_match = re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text)
+                if phone_match:
+                    phone = phone_match.group(0)
+            
+            return email, phone
+        except:
+            return None, None

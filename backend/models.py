@@ -9,13 +9,14 @@ import logging
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 import hashlib
 
+from config import DATABASE_URL
+
 if TYPE_CHECKING:
     from sqlalchemy.orm.decl_api import DeclarativeBase
 
 logger = logging.getLogger(__name__)
 
-# Database setup
-DATABASE_URL = "postgresql://procurement_user:procurement_pass@postgres:5432/procurement_scanner"
+# Database setup with environment variable support
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base: Any = declarative_base()
