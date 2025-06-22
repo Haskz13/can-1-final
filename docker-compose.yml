@@ -34,6 +34,46 @@ services:
       timeout: 3s
       retries: 5
 
+  # Selenium Grid Hub
+  selenium-hub:
+    image: selenium/hub:4.15.0
+    container_name: selenium_hub
+    ports:
+      - "4444:4444"
+      - "4442:4442"
+      - "4443:4443"
+    environment:
+      - SE_NODE_MAX_SESSIONS=5
+      - SE_NODE_SESSION_TIMEOUT=86400
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Selenium Chrome Node
+  selenium-chrome:
+    image: selenium/node-chrome:4.15.0
+    depends_on:
+      selenium-hub:
+        condition: service_healthy
+    environment:
+      - SE_EVENT_BUS_HOST=selenium-hub
+      - SE_EVENT_BUS_PUBLISH_PORT=4442
+      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
+      - SE_NODE_MAX_SESSIONS=3
+    volumes:
+      - /dev/shm:/dev/shm
+    deploy:
+      replicas: 2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   # Backend API
   backend:
     build:
@@ -46,7 +86,7 @@ services:
       redis:
         condition: service_healthy
       selenium-hub:
-        condition: service_started
+        condition: service_healthy
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-procurement_user}:${POSTGRES_PASSWORD:-procurement_pass}@postgres:5432/${POSTGRES_DB:-procurement_scanner}
@@ -59,33 +99,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     command: python main.py
-
-  # Selenium Grid Hub
-  selenium-hub:
-    image: selenium/hub:4.15.0
-    container_name: selenium_hub
-    ports:
-      - "4444:4444"
-      - "4442:4442"
-      - "4443:4443"
-    environment:
-      - SE_NODE_MAX_SESSIONS=5
-      - SE_NODE_SESSION_TIMEOUT=86400
-
-  # Selenium Chrome Node
-  selenium-chrome:
-    image: selenium/node-chrome:4.15.0
-    depends_on:
-      - selenium-hub
-    environment:
-      - SE_EVENT_BUS_HOST=selenium-hub
-      - SE_EVENT_BUS_PUBLISH_PORT=4442
-      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
-      - SE_NODE_MAX_SESSIONS=3
-    volumes:
-      - /dev/shm:/dev/shm
-    deploy:
-      replicas: 2
+    restart: unless-stopped
 
   # Celery worker for background jobs
   celery:
@@ -99,7 +113,7 @@ services:
       redis:
         condition: service_healthy
       selenium-hub:
-        condition: service_started
+        condition: service_healthy
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-procurement_user}:${POSTGRES_PASSWORD:-procurement_pass}@postgres:5432/${POSTGRES_DB:-procurement_scanner}
@@ -110,6 +124,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     command: celery -A tasks worker --loglevel=info
+    restart: unless-stopped
 
   # Celery beat for scheduled tasks
   celery-beat:
@@ -130,6 +145,7 @@ services:
       - ./backend:/app
       - ./logs:/app/logs
     command: celery -A tasks beat --loglevel=info
+    restart: unless-stopped
 
   # Frontend
   frontend:
@@ -140,9 +156,11 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_started
     environment:
       - REACT_APP_API_URL=http://localhost:8000/api
+    restart: unless-stopped
 
 volumes:
   postgres_data:

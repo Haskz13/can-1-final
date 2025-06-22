@@ -121,7 +121,7 @@ def test_portal_urls():
             ("https://www.bcbid.gov.bc.ca/", "BC Bid"),
         ]
         
-        results = []
+        results: List[bool] = []
         for url, name in test_urls:
             result = await test_url(url, name)
             results.append(result)

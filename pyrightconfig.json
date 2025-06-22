@@ -1,0 +1,53 @@
+{
+    "include": [
+        "backend"
+    ],
+    "exclude": [
+        "**/node_modules",
+        "**/__pycache__",
+        ".git",
+        "data",
+        "logs",
+        "frontend"
+    ],
+    "ignore": [
+        "**/node_modules",
+        "**/__pycache__"
+    ],
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
+    "reportMissingTypeStubs": "none",
+    "reportUnknownVariableType": "none",
+    "reportInvalidTypeForm": "none",
+    "reportUnusedImport": "none",
+    "reportMissingTypeArgument": "none",
+    "reportPrivateImportUsage": "none",
+    "reportPropertyTypeMismatch": "none",
+    "reportSelfClsParameterName": "none",
+    "reportTypeCommentUsage": "none",
+    "reportUndefinedVariable": "none",
+    "reportUnnecessaryCast": "none",
+    "reportUnnecessaryComparison": "none",
+    "reportUnnecessaryContains": "none",
+    "reportUnnecessaryIsInstance": "none",
+    "reportUnnecessaryTypeIgnoreComment": "none",
+    "reportUnusedCallResult": "none",
+    "reportUnusedExpression": "none",
+    "reportAttributeAccessIssue": "none",
+    "reportOptionalOperand": "none",
+    "pythonVersion": "3.11",
+    "pythonPlatform": "Linux",
+    "executionEnvironments": [
+        {
+            "root": "backend",
+            "pythonVersion": "3.11",
+            "pythonPlatform": "Linux",
+            "extraPaths": [
+                "backend",
+                "backend/models",
+                "backend/selenium_utils",
+                "backend/scrapers"
+            ]
+        }
+    ]
+} 

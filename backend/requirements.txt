@@ -17,6 +17,7 @@ openpyxl==3.1.2  # For Excel file handling
 
 # Web Scraping
 aiohttp==3.9.1
+requests==2.31.0  # For HTTP requests
 beautifulsoup4==4.12.2
 lxml==4.9.3
 selenium==4.15.2

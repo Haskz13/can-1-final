@@ -4,7 +4,7 @@ from celery.schedules import crontab
 import os
 from datetime import datetime, timedelta
 import logging
-from typing import List, Dict
+from typing import List, Dict, Any
 import asyncio
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -16,16 +16,17 @@ from email.mime.base import MIMEBase
 from email import encoders
 import pandas as pd
 from pathlib import Path
+from sqlalchemy import desc
 
-# Import from main module
+# Import from models module (instead of main)
+from models import SessionLocal, Tender, save_tender_to_db
+
+# Import from main module (only what we need)
 from main import (
-    SessionLocal, 
-    Tender, 
     ProcurementScanner, 
     PORTAL_CONFIGS,
     TenderMatcher,
     TKA_COURSES,
-    save_tender_to_db,
     logger
 )
 
@@ -43,9 +44,9 @@ SCRAPER_DISPATCHER = {
     'canadabuys': 'scan_canadabuys',  # Now uses API
     'merx': 'scan_merx',
     'bcbid': 'scan_bcbid',
-    'seao': 'scan_seao',
-    'toronto': 'scan_ariba_portal',
+    'seao': 'scan_seao_web',  # Fixed: use scan_seao_web method
     'biddingo': 'scan_biddingo',
+    'bidsandtenders': 'scan_bidsandtenders_portal',
     
     # bids&tenders platform cities
     'edmonton': 'scan_bidsandtenders_portal',
@@ -181,7 +182,7 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
     The async helper that iterates through portals and calls the correct scraper function.
     """
     driver = None
-    session = await scanner.get_session()
+    session = SessionLocal()  # Use SessionLocal for DB session
     
     for portal_id in portal_ids:
         if portal_id not in PORTAL_CONFIGS:
@@ -200,9 +201,15 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
                 tenders = await scanner.scan_canadabuys()
                 if tenders:
                     _process_tenders(tenders, config['name'], results, matcher)
+                # Ensure results['scanned'] and results['errors'] are lists before appending
+                if not isinstance(results['scanned'], list):
+                    results['scanned'] = []
                 results['scanned'].append(portal_id)
             except Exception as e:
                 logger.error(f"Error scanning {config['name']} API: {e}")
+                # Ensure results['errors'] is a list before appending
+                if not isinstance(results['errors'], list):
+                    results['errors'] = []
                 results['errors'].append({'portal': config['name'], 'error': str(e)})
             continue
             
@@ -210,13 +217,19 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
             # bids&tenders platform
             try:
                 logger.info(f"Scanning {config['name']} via bids&tenders platform")
-                tenders = await scanner.scan_bidsandtenders_portal(config['name'], config['search_url'])
+                tenders = await scanner.scan_bidsandtenders_portal(config['name'], config['search_url'])  # type: ignore[arg-type]
                 if tenders:
-                    _process_tenders(tenders, config['name'], results, matcher)
+                    _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
+                # Ensure results['scanned'] and results['errors'] are lists before appending
+                if not isinstance(results['scanned'], list):
+                    results['scanned'] = []
                 results['scanned'].append(portal_id)
             except Exception as e:
                 logger.error(f"Error scanning {config['name']}: {e}")
-                results['errors'].append({'portal': config['name'], 'error': str(e)})
+                # Ensure results['errors'] is a list before appending
+                if not isinstance(results['errors'], list):
+                    results['errors'] = []
+                results['errors'].append({'portal': config['name'], 'error': str(e)})  # type: ignore[arg-type]
             continue
 
         # Handle dispatcher-based scrapers
@@ -233,7 +246,7 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
             
             if config.get('requires_selenium', False):
                 if driver is None:
-                    driver = scanner.selenium.get_driver()
+                    driver = scanner.selenium.create_driver()
                 
                 # Check if the function is a method of the scanner instance
                 if hasattr(scanner, scraper_func_ref.__name__):
@@ -244,21 +257,27 @@ async def _execute_scans_async(scanner: ProcurementScanner, portal_ids: List[str
                     else:
                         tenders = await method_to_call()
                 else: # Static method from scrapers.py
-                    tenders = await scraper_func_ref(driver, scanner.selenium)
+                    tenders = await scraper_func_ref(driver, scanner.selenium)  # type: ignore[operator]
             else: # Non-selenium static method
-                tenders = await scraper_func_ref(session)
+                tenders = await scraper_func_ref(session)  # type: ignore[operator]
             
             if tenders:
-                 _process_tenders(tenders, config['name'], results, matcher)
+                 _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
+            # Ensure results['scanned'] and results['errors'] are lists before appending
+            if not isinstance(results['scanned'], list):
+                results['scanned'] = []
             results['scanned'].append(portal_id)
 
         except Exception as e:
             logger.error(f"Error scanning {config['name']}: {e}", exc_info=True)
-            results['errors'].append({'portal': config['name'], 'error': str(e)})
+            # Ensure results['errors'] is a list before appending
+            if not isinstance(results['errors'], list):
+                results['errors'] = []
+            results['errors'].append({'portal': config['name'], 'error': str(e)})  # type: ignore[arg-type]
         
     if driver:
         driver.quit()
-    await scanner.close_session()
+    session.close()
 
 
 @app.task(bind=True, max_retries=3)
@@ -288,28 +307,28 @@ def scan_specific_portals_task(self, portal_ids: List[str]):
 def scan_all_portals_task():
     """Scan all configured portals."""
     all_portal_ids = list(PORTAL_CONFIGS.keys())
-    return scan_specific_portals_task.delay(all_portal_ids)
+    return scan_specific_portals_task.delay(all_portal_ids)  # type: ignore[attr-defined]
 
 
 @app.task
 def scan_high_priority_portals():
     """Scan only high-traffic portals more frequently."""
     high_priority_ids = ['canadabuys', 'merx', 'toronto', 'ontario', 'bcbid', 'seao']
-    return scan_specific_portals_task.delay(high_priority_ids)
+    return scan_specific_portals_task.delay(high_priority_ids)  # type: ignore[attr-defined]
 
 
 @app.task
 def scan_api_portals():
     """Scan portals with API access for real-time updates."""
     api_portal_ids = [k for k,v in PORTAL_CONFIGS.items() if v.get('type') in ['api', 'api_and_scrape']]
-    return scan_specific_portals_task.delay(api_portal_ids)
+    return scan_specific_portals_task.delay(api_portal_ids)  # type: ignore[attr-defined]
 
 
 @app.task
 def scan_municipal_portals():
     """Scan all municipal portals."""
     municipal_ids = [k for k,v in PORTAL_CONFIGS.items() if 'City of' in v['name'] or 'Municipality' in v['name']]
-    return scan_specific_portals_task.delay(municipal_ids)
+    return scan_specific_portals_task.delay(municipal_ids)  # type: ignore[attr-defined]
 
 
 @app.task
@@ -319,7 +338,7 @@ def scan_provincial_portals():
     provincial_ids = [k for k,v in PORTAL_CONFIGS.items() 
                       if any(keyword in v['name'] for keyword in provincial_keywords) 
                       and 'City' not in v['name']]
-    return scan_specific_portals_task.delay(provincial_ids)
+    return scan_specific_portals_task.delay(provincial_ids)  # type: ignore[attr-defined]
 
 
 @app.task
@@ -358,12 +377,14 @@ def generate_daily_report():
         
         # New tenders today
         new_today = db.query(Tender).filter(
+            Tender.posted_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
             Tender.posted_date >= today_start
         ).all()
         
         # Closing soon (next 3 days)
         closing_soon = db.query(Tender).filter(
             Tender.is_active == True,
+            Tender.closing_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
             Tender.closing_date <= datetime.utcnow() + timedelta(days=3),
             Tender.closing_date > datetime.utcnow()
         ).order_by(Tender.closing_date).all()
@@ -372,7 +393,7 @@ def generate_daily_report():
         high_priority = db.query(Tender).filter(
             Tender.is_active == True,
             Tender.priority == 'high'
-        ).order_by(Tender.value.desc()).limit(10).all()
+        ).order_by(desc(Tender.value)).limit(10).all()
         
         # Generate report content
         report_html = generate_report_html(new_today, closing_soon, high_priority)
@@ -382,7 +403,7 @@ def generate_daily_report():
             send_email_report(
                 subject=f"Daily Procurement Report - {datetime.now().strftime('%Y-%m-%d')}",
                 body=report_html,
-                recipients=os.getenv('REPORT_RECIPIENTS').split(',')
+                recipients=os.getenv('REPORT_RECIPIENTS').split(',')  # type: ignore[attr-defined]
             )
             
         return {
@@ -442,7 +463,7 @@ def generate_report_html(new_tenders, closing_soon, high_priority):
 
 
 def generate_tender_table(tenders):
-    """Generate HTML table for tenders"""
+    """Generate HTML table from tenders"""
     if not tenders:
         return "<p>No tenders in this category.</p>"
         
@@ -458,7 +479,7 @@ def generate_tender_table(tenders):
             <td>{tender.organization}</td>
             <td>{tender.portal}</td>
             <td>${tender.value:,.0f}</td>
-            <td>{tender.closing_date.strftime('%Y-%m-%d')}</td>
+            <td>{tender.closing_date.strftime('%Y-%m-%d') if tender.closing_date else 'N/A'}</td>
             <td class="{priority_class}">{tender.priority.upper()}</td>
             <td>{', '.join(matching_courses[:2])}</td>
         </tr>
@@ -510,20 +531,30 @@ def generate_weekly_summary():
         
         # Get weekly statistics
         weekly_stats = {
-            'total_new': db.query(Tender).filter(Tender.posted_date >= week_start).count(),
+            'total_new': db.query(Tender).filter(
+                Tender.posted_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
+                Tender.posted_date >= week_start
+            ).count(),
             'total_closed': db.query(Tender).filter(
+                Tender.closing_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
                 Tender.closing_date >= week_start,
                 Tender.closing_date < datetime.utcnow()
             ).count(),
             'by_portal': db.query(
                 Tender.portal,
                 func.count(Tender.id).label('count')
-            ).filter(Tender.posted_date >= week_start).group_by(Tender.portal).all(),
+            ).filter(
+                Tender.posted_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
+                Tender.posted_date >= week_start
+            ).group_by(Tender.portal).all(),
             'by_category': {}
         }
         
         # Analyze categories
-        tenders = db.query(Tender).filter(Tender.posted_date >= week_start).all()
+        tenders = db.query(Tender).filter(
+            Tender.posted_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
+            Tender.posted_date >= week_start
+        ).all()
         category_counts = {}
         for tender in tenders:
             if tender.categories:
@@ -604,7 +635,7 @@ def analyze_tender_trends():
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=30)
         
-        trends = {
+        trends: Dict[str, Any] = {
             'daily_counts': [],
             'portal_trends': {},
             'category_trends': {},
@@ -619,6 +650,7 @@ def analyze_tender_trends():
             day_end = day_start + timedelta(days=1)
             
             count = db.query(Tender).filter(
+                Tender.posted_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
                 Tender.posted_date >= day_start,
                 Tender.posted_date < day_end
             ).count()
@@ -633,8 +665,9 @@ def analyze_tender_trends():
             Tender.organization,
             func.count(Tender.id).label('count')
         ).filter(
+            Tender.posted_date.isnot(None),  # type: ignore[reportAttributeAccessIssue]
             Tender.posted_date >= start_date
-        ).group_by(Tender.organization).order_by(func.count(Tender.id).desc()).limit(10).all()
+        ).group_by(Tender.organization).order_by(desc(func.count(Tender.id))).limit(10).all()
         
         trends['top_organizations'] = [{'org': org, 'count': count} for org, count in top_orgs]
         
@@ -644,4 +677,4 @@ def analyze_tender_trends():
     except Exception as e:
         logger.error(f"Error analyzing trends: {e}")
     finally:
-        db.close()
+        db.close() 

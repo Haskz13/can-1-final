@@ -23,18 +23,11 @@ type Tender = {
   matching_courses: string[];
 };
 
-// Define the 'shape' of a Portal object
-type Portal = {
-  id: string;
-  name: string;
-};
-
 // Define the shape of the Stats object
 type Stats = {
     total_tenders: number;
     total_value: number;
-    by_portal: { portal: string; count: number; value: number }[];
-    by_category: { [key: string]: number };
+    by_portal: { portal: string; count: number; total_value: number }[];
     closing_soon: number;
     new_today: number;
     last_scan: string | null;
@@ -45,11 +38,11 @@ const ProcurementDashboard = () => {
   const [tenders, setTenders] = useState<Tender[]>([]);
   const [loading, setLoading] = useState(false);
   const [scanningStatus, setScanningStatus] = useState('idle');
+  const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<Stats>({
     total_tenders: 0,
     total_value: 0,
     by_portal: [],
-    by_category: {},
     closing_soon: 0,
     new_today: 0,
     last_scan: null
@@ -61,42 +54,37 @@ const ProcurementDashboard = () => {
     search: '',
     priority: ''
   });
-  const [portals, setPortals] = useState<Portal[]>([]);
   const [selectedTender, setSelectedTender] = useState<Tender | null>(null);
 
   // Use environment variable or default to localhost for development
   const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000/api';
 
-  // Fetch portals list
-  const fetchPortals = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/portals`);
-      const data = await response.json();
-      setPortals(data.portals || []);
-    } catch (error) {
-      console.error('Error fetching portals:', error);
-    }
-  };
-
   // Fetch tenders from API
   const fetchTenders = async () => {
     setLoading(true);
+    setError(null);
     try {
+      console.log('Fetching tenders from:', `${API_BASE}/tenders`);
       const params = new URLSearchParams({
         skip: '0',
         limit: '100',
         ...(filters.portal && { portal: filters.portal }),
-        ...(filters.minValue && { min_value: filters.minValue }),
-        ...(filters.category && { category: filters.category }),
-        ...(filters.search && { search: filters.search }),
-        ...(filters.priority && { priority: filters.priority })
+        ...(filters.search && { search: filters.search })
       });
 
       const response = await fetch(`${API_BASE}/tenders?${params}`);
+      console.log('Response status:', response.status);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
       const data = await response.json();
-      setTenders(Array.isArray(data) ? data : []);
+      console.log('Received data:', data);
+      setTenders(data.tenders || []);
     } catch (error) {
       console.error('Error fetching tenders:', error);
+      setError(error instanceof Error ? error.message : 'Unknown error occurred');
       setTenders([]);
     } finally {
       setLoading(false);
@@ -106,22 +94,19 @@ const ProcurementDashboard = () => {
   // Fetch statistics
   const fetchStats = async () => {
     try {
+      console.log('Fetching stats from:', `${API_BASE}/stats`);
       const response = await fetch(`${API_BASE}/stats`);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
       const data = await response.json();
+      console.log('Received stats:', data);
       setStats(data);
     } catch (error) {
       console.error('Error fetching stats:', error);
-    }
-  };
-
-  // Fetch tender details
-  const fetchTenderDetails = async (tenderId: string) => {
-    try {
-      const response = await fetch(`${API_BASE}/tender/${tenderId}`);
-      const data = await response.json();
-      setSelectedTender(data);
-    } catch (error) {
-      console.error('Error fetching tender details:', error);
+      setError(error instanceof Error ? error.message : 'Unknown error occurred');
     }
   };
 
@@ -138,7 +123,6 @@ const ProcurementDashboard = () => {
       setTimeout(() => {
         fetchTenders();
         fetchStats();
-        fetchPortals();
         setScanningStatus('complete');
         setTimeout(() => setScanningStatus('idle'), 3000);
       }, 10000);
@@ -159,7 +143,7 @@ const ProcurementDashboard = () => {
         `"${t.organization.replace(/"/g, '""')}"`,
         t.portal,
         t.value,
-        new Date(t.closing_date).toLocaleDateString(),
+        t.closing_date ? new Date(t.closing_date).toLocaleDateString() : 'N/A',
         t.location,
         t.priority,
         `"${t.matching_courses.join('; ')}"`,
@@ -178,7 +162,6 @@ const ProcurementDashboard = () => {
 
   // Initial data load
   useEffect(() => {
-    fetchPortals();
     fetchTenders();
     fetchStats();
     
@@ -238,6 +221,15 @@ const ProcurementDashboard = () => {
   return (
     <div className="min-h-screen bg-gray-100">
       <div className="max-w-7xl mx-auto px-4 py-8">
+        {/* Debug Info */}
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+          <h3 className="text-lg font-medium text-yellow-800">Debug Info</h3>
+          <p className="text-yellow-700">API Base: {API_BASE}</p>
+          <p className="text-yellow-700">Loading: {loading ? 'Yes' : 'No'}</p>
+          <p className="text-yellow-700">Tenders Count: {tenders.length}</p>
+          <p className="text-yellow-700">Error: {error || 'None'}</p>
+        </div>
+
         {/* Header */}
         <div className="bg-white rounded-lg shadow-md p-6 mb-6">
           <div className="flex justify-between items-center mb-4">
@@ -246,7 +238,7 @@ const ProcurementDashboard = () => {
                 Canadian Procurement Intelligence Scanner
               </h1>
               <p className="text-gray-600 mt-2">
-                Real-time monitoring of {portals.length} procurement portals across Canada
+                Real-time monitoring of {tenders.length} procurement portals across Canada
               </p>
             </div>
             <div className="flex gap-2">
@@ -271,6 +263,23 @@ const ProcurementDashboard = () => {
               </button>
             </div>
           </div>
+          
+          {/* Error Display */}
+          {error && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
+              <div className="flex items-center">
+                <AlertCircle className="w-5 h-5 text-red-400 mr-2" />
+                <h3 className="text-lg font-medium text-red-800">Error</h3>
+              </div>
+              <p className="text-red-700 mt-1">{error}</p>
+              <button 
+                onClick={() => setError(null)}
+                className="mt-2 text-red-600 hover:text-red-800 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           
           {/* Stats Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -329,7 +338,7 @@ const ProcurementDashboard = () => {
                 <div key={portal.portal} className="text-center p-3 bg-gray-50 rounded hover:bg-gray-100 transition-colors">
                   <p className="text-sm font-medium text-gray-700">{portal.portal}</p>
                   <p className="text-lg font-bold text-blue-600">{portal.count}</p>
-                  <p className="text-xs text-gray-500">{formatCurrency(portal.value)}</p>
+                  <p className="text-xs text-gray-500">{formatCurrency(portal.total_value)}</p>
                 </div>
               ))}
             </div>
@@ -364,8 +373,8 @@ const ProcurementDashboard = () => {
                 onChange={(e) => setFilters({...filters, portal: e.target.value})}
               >
                 <option value="">All Portals</option>
-                {portals.map(portal => (
-                  <option key={portal.id} value={portal.name}>{portal.name}</option>
+                {tenders.map(tender => (
+                  <option key={tender.portal} value={tender.portal}>{tender.portal}</option>
                 ))}
               </select>
             </div>
@@ -435,25 +444,6 @@ const ProcurementDashboard = () => {
           </div>
         </div>
 
-        {/* Category Distribution */}
-        {Object.keys(stats.by_category).length > 0 && (
-          <div className="bg-white rounded-lg shadow-md p-6 mb-6">
-            <h2 className="text-xl font-semibold mb-4">Category Distribution</h2>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {Object.entries(stats.by_category).map(([category, count]) => (
-                <div 
-                  key={category} 
-                  className="p-3 bg-gray-50 rounded cursor-pointer hover:bg-gray-100 transition-colors"
-                  onClick={() => setFilters({...filters, category: category})}
-                >
-                  <p className="text-sm font-medium capitalize">{category.replace('-', ' ')}</p>
-                  <p className="text-lg font-bold text-blue-600">{count as number}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
         {/* Tenders List */}
         <div className="bg-white rounded-lg shadow-md p-6">
           <h2 className="text-xl font-semibold mb-4">
@@ -480,7 +470,7 @@ const ProcurementDashboard = () => {
                   <div
                     key={tender.id}
                     className={`border-l-4 p-4 rounded ${getPriorityColor(tender.priority)} transition-all hover:shadow-md cursor-pointer`}
-                    onClick={() => fetchTenderDetails(tender.id)}
+                    onClick={() => setSelectedTender(tender)}
                   >
                     <div className="flex justify-between items-start mb-2">
                       <div className="flex-1">
