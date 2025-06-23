@@ -5,7 +5,7 @@ from celery.result import AsyncResult
 import os
 from datetime import datetime, timedelta
 import logging
-from typing import List, Dict, Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, Callable, Union
 import asyncio
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -18,6 +18,8 @@ from email import encoders
 import pandas as pd
 from pathlib import Path
 from sqlalchemy import desc
+import aiohttp
+from aiohttp import ClientSession
 
 # Type checking imports
 if TYPE_CHECKING:
@@ -103,6 +105,14 @@ SCRAPER_DISPATCHER = {
     'saskatoon': 'sasktenders'  # Saskatoon uses SaskTenders
 }
 
+# Define which static scrapers expect only session (non-Selenium)
+SESSION_ONLY_SCRAPERS = {
+    'manitoba': ProvincialScrapers.scan_manitoba_tenders,
+    'winnipeg': MunicipalScrapers.scan_winnipeg_bids,
+    'pei': SpecializedScrapers.scan_pei_tenders,
+    'nl': SpecializedScrapers.scan_nl_procurement,
+}
+
 # Configure Celery
 app = Celery(
     'procurement_scanner',
@@ -163,7 +173,7 @@ app.conf.beat_schedule = {
 }
 
 
-def _process_tenders(tenders: List[Dict], portal_name: str, results: Dict, matcher: TenderMatcher):
+def _process_tenders(tenders: list[dict], portal_name: str, results: dict, matcher: TenderMatcher):
     """Process and save tenders to database using the helper function from main."""
     if not tenders:
         return
@@ -194,139 +204,165 @@ def _process_tenders(tenders: List[Dict], portal_name: str, results: Dict, match
         db.close()
 
 
-async def _execute_scans_async(portal_ids: List[str], results: Dict, matcher: TenderMatcher):
+async def _execute_scans_async(portal_ids: list[str], results: dict, matcher: TenderMatcher):
     """
     The async helper that iterates through portals and calls the correct scraper function.
     """
     # Lazy import to avoid circular dependency
     scanner = get_procurement_scanner()
     driver = None
-    session = SessionLocal()  # Use SessionLocal for DB session
+    db_session = SessionLocal()  # Use SessionLocal for DB session
     
-    for portal_id in portal_ids:
-        if portal_id not in PORTAL_CONFIGS:
-            logger.warning(f"Configuration for portal_id '{portal_id}' not found. Skipping.")
-            continue
+    # Create HTTP session for session-only scrapers
+    async with aiohttp.ClientSession() as http_session:
+        for portal_id in portal_ids:
+            if portal_id not in PORTAL_CONFIGS:
+                logger.warning(f"Configuration for portal_id '{portal_id}' not found. Skipping.")
+                continue
 
-        config = PORTAL_CONFIGS[portal_id]
-        portal_type = config.get('type')
-        scraper_func_ref = SCRAPER_DISPATCHER.get(portal_id)
+            config = PORTAL_CONFIGS[portal_id]
+            portal_type = config.get('type')
+            scraper_func_ref = SCRAPER_DISPATCHER.get(portal_id)
 
-        # Handle special portal types
-        if portal_type == 'api':
-            # API-based portals like CanadaBuys
+            # Handle special portal types
+            if portal_type == 'api':
+                # API-based portals like CanadaBuys
+                try:
+                    logger.info(f"Scanning {config['name']} via API")
+                    tenders = await scanner.scan_canadabuys()
+                    if tenders:
+                        _process_tenders(tenders, config['name'], results, matcher)
+                    # Ensure results['scanned'] and results['errors'] are lists before appending
+                    if not isinstance(results['scanned'], list):
+                        results['scanned'] = []
+                    results['scanned'].append(portal_id)
+                except Exception as e:
+                    logger.error(f"Error scanning {config['name']} API: {e}")
+                    # Ensure results['errors'] is a list before appending
+                    if not isinstance(results['errors'], list):
+                        results['errors'] = []
+                    results['errors'].append({'portal': config['name'], 'error': str(e)})
+                continue
+                
+            elif portal_type == 'bidsandtenders':
+                # bids&tenders platform
+                try:
+                    logger.info(f"Scanning {config['name']} via bids&tenders platform")
+                    tenders = await scanner.scan_bidsandtenders_portal(config['name'], config['search_url'])  # type: ignore[arg-type]
+                    if tenders:
+                        _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
+                    # Ensure results['scanned'] and results['errors'] are lists before appending
+                    if not isinstance(results['scanned'], list):
+                        results['scanned'] = []
+                    results['scanned'].append(portal_id)
+                except Exception as e:
+                    logger.error(f"Error scanning {config['name']}: {e}")
+                    # Ensure results['errors'] is a list before appending
+                    if not isinstance(results['errors'], list):
+                        results['errors'] = []
+                    results['errors'].append({'portal': config['name'], 'error': str(e)})  # type: ignore[arg-type]
+                continue
+
+            # Handle dispatcher-based scrapers
+            if isinstance(scraper_func_ref, str) and scraper_func_ref in SCRAPER_DISPATCHER:
+                scraper_func_ref = SCRAPER_DISPATCHER.get(scraper_func_ref)
+
+            # Ensure we have a callable function
+            if not scraper_func_ref or not callable(scraper_func_ref):
+                logger.warning(f"No valid scraper function found for portal: {portal_id}")
+                continue
+
+            # Type assertion to ensure scraper_func_ref is callable
+            scraper_func = scraper_func_ref  # type: ignore[assignment]
+            if not hasattr(scraper_func, '__call__'):
+                logger.warning(f"Scraper function for portal {portal_id} is not callable")
+                continue
+
             try:
-                logger.info(f"Scanning {config['name']} via API")
-                tenders = await scanner.scan_canadabuys()
+                logger.info(f"Scanning portal: {config['name']}")
+                tenders: Any = []
+                
+                # Determine if portal needs Selenium based on type
+                needs_selenium = portal_type == 'web' or config.get('requires_selenium', False)
+                
+                if needs_selenium:
+                    if driver is None:
+                        driver = scanner.selenium.create_driver()
+                    
+                    # Check if the function is a method of the scanner instance
+                    if hasattr(scanner, scraper_func.__name__):
+                        method_to_call = getattr(scanner, scraper_func.__name__)
+                        # Handle methods that need extra arguments
+                        if scraper_func.__name__ in ['scan_ariba_portal', 'scan_biddingo']:
+                            tenders = await method_to_call(config['name'], config)
+                        elif scraper_func.__name__ in ['scan_canadabuys', 'scan_merx', 'scan_bcbid', 'scan_seao_web', 'scan_bidsandtenders_portal']:
+                            # These expect driver and selenium_helper
+                            tenders = await method_to_call(driver, scanner.selenium)
+                        else:
+                            # Most other methods expect no arguments
+                            tenders = await method_to_call()
+                    else: # Static method from scrapers.py
+                        # Check if this is a session-only scraper
+                        if scraper_func in SESSION_ONLY_SCRAPERS.values():
+                            # Session-only scrapers expect HTTP session
+                            if asyncio.iscoroutinefunction(scraper_func):
+                                tenders = await scraper_func(http_session)  # type: ignore
+                            else:
+                                loop = asyncio.get_event_loop()
+                                tenders = await loop.run_in_executor(None, lambda: scraper_func(http_session))  # type: ignore
+                        else:
+                            # Non-session scrapers still need driver and selenium_helper
+                            if driver is None:
+                                driver = scanner.selenium.create_driver()
+                            if asyncio.iscoroutinefunction(scraper_func):
+                                tenders = await scraper_func(driver, scanner.selenium)  # type: ignore
+                            else:
+                                loop = asyncio.get_event_loop()
+                                tenders = await loop.run_in_executor(None, lambda: scraper_func(driver, scanner.selenium))  # type: ignore
+                else: # Non-selenium static method
+                    # Check if this is a session-only scraper
+                    if scraper_func in SESSION_ONLY_SCRAPERS.values():
+                        # Session-only scrapers expect HTTP session
+                        if asyncio.iscoroutinefunction(scraper_func):
+                            tenders = await scraper_func(http_session)  # type: ignore
+                        else:
+                            loop = asyncio.get_event_loop()
+                            tenders = await loop.run_in_executor(None, lambda: scraper_func(http_session))  # type: ignore
+                    else:
+                        # Non-session scrapers still need driver and selenium_helper
+                        if driver is None:
+                            driver = scanner.selenium.create_driver()
+                        if asyncio.iscoroutinefunction(scraper_func):
+                            tenders = await scraper_func(driver, scanner.selenium)  # type: ignore
+                        else:
+                            loop = asyncio.get_event_loop()
+                            tenders = await loop.run_in_executor(None, lambda: scraper_func(driver, scanner.selenium))  # type: ignore
+                
                 if tenders:
-                    _process_tenders(tenders, config['name'], results, matcher)
+                    # Ensure tenders is a list before processing
+                    if isinstance(tenders, list):
+                        _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
+                    else:
+                        logger.warning(f"Unexpected tenders type for {config['name']}: {type(tenders)}")
                 # Ensure results['scanned'] and results['errors'] are lists before appending
                 if not isinstance(results['scanned'], list):
                     results['scanned'] = []
                 results['scanned'].append(portal_id)
+
             except Exception as e:
-                logger.error(f"Error scanning {config['name']} API: {e}")
-                # Ensure results['errors'] is a list before appending
-                if not isinstance(results['errors'], list):
-                    results['errors'] = []
-                results['errors'].append({'portal': config['name'], 'error': str(e)})
-            continue
-            
-        elif portal_type == 'bidsandtenders':
-            # bids&tenders platform
-            try:
-                logger.info(f"Scanning {config['name']} via bids&tenders platform")
-                tenders = await scanner.scan_bidsandtenders_portal(config['name'], config['search_url'])  # type: ignore[arg-type]
-                if tenders:
-                    _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
-                # Ensure results['scanned'] and results['errors'] are lists before appending
-                if not isinstance(results['scanned'], list):
-                    results['scanned'] = []
-                results['scanned'].append(portal_id)
-            except Exception as e:
-                logger.error(f"Error scanning {config['name']}: {e}")
+                logger.error(f"Error scanning {config['name']}: {e}", exc_info=True)
                 # Ensure results['errors'] is a list before appending
                 if not isinstance(results['errors'], list):
                     results['errors'] = []
                 results['errors'].append({'portal': config['name'], 'error': str(e)})  # type: ignore[arg-type]
-            continue
-
-        # Handle dispatcher-based scrapers
-        if isinstance(scraper_func_ref, str) and scraper_func_ref in SCRAPER_DISPATCHER:
-            scraper_func_ref = SCRAPER_DISPATCHER.get(scraper_func_ref)
-
-        # Ensure we have a callable function
-        if not scraper_func_ref or not callable(scraper_func_ref):
-            logger.warning(f"No valid scraper function found for portal: {portal_id}")
-            continue
-
-        # Type assertion to ensure scraper_func_ref is callable
-        scraper_func = scraper_func_ref  # type: ignore[assignment]
-        if not hasattr(scraper_func, '__call__'):
-            logger.warning(f"Scraper function for portal {portal_id} is not callable")
-            continue
-
-        try:
-            logger.info(f"Scanning portal: {config['name']}")
-            tenders: Any = []
             
-            # Determine if portal needs Selenium based on type
-            needs_selenium = portal_type == 'web' or config.get('requires_selenium', False)
-            
-            if needs_selenium:
-                if driver is None:
-                    driver = scanner.selenium.create_driver()
-                
-                # Check if the function is a method of the scanner instance
-                if hasattr(scanner, scraper_func.__name__):
-                    method_to_call = getattr(scanner, scraper_func.__name__)
-                    # Handle methods that need extra arguments
-                    if scraper_func.__name__ in ['scan_ariba_portal', 'scan_biddingo']:
-                         tenders = await method_to_call(config['name'], config)
-                    else:
-                        tenders = await method_to_call()
-                else: # Static method from scrapers.py
-                    # Check if the function is async before awaiting
-                    if asyncio.iscoroutinefunction(scraper_func):
-                        tenders = await scraper_func(driver, scanner.selenium)
-                    else:
-                        # Handle sync functions by running them in a thread pool
-                        loop = asyncio.get_event_loop()
-                        tenders = await loop.run_in_executor(None, lambda: scraper_func(driver, scanner.selenium))
-            else: # Non-selenium static method
-                # Check if the function is async before awaiting
-                if asyncio.iscoroutinefunction(scraper_func):
-                    tenders = await scraper_func(session)
-                else:
-                    # Handle sync functions by running them in a thread pool
-                    loop = asyncio.get_event_loop()
-                    tenders = await loop.run_in_executor(None, lambda: scraper_func(session))
-            
-            if tenders:
-                # Ensure tenders is a list before processing
-                if isinstance(tenders, list):
-                    _process_tenders(tenders, config['name'], results, matcher)  # type: ignore[arg-type]
-                else:
-                    logger.warning(f"Unexpected tenders type for {config['name']}: {type(tenders)}")
-            # Ensure results['scanned'] and results['errors'] are lists before appending
-            if not isinstance(results['scanned'], list):
-                results['scanned'] = []
-            results['scanned'].append(portal_id)
-
-        except Exception as e:
-            logger.error(f"Error scanning {config['name']}: {e}", exc_info=True)
-            # Ensure results['errors'] is a list before appending
-            if not isinstance(results['errors'], list):
-                results['errors'] = []
-            results['errors'].append({'portal': config['name'], 'error': str(e)})  # type: ignore[arg-type]
-        
-    if driver:
-        driver.quit()
-    session.close()
+        if driver:
+            driver.quit()
+        db_session.close()
 
 
 @app.task(bind=True, max_retries=3)
-def scan_specific_portals_task(self, portal_ids: List[str]):
+def scan_specific_portals_task(self, portal_ids: list[str]):
     """The new master task that scans a specific list of portals using the dispatcher."""
     scanner = get_procurement_scanner()
     loop = asyncio.new_event_loop()
@@ -352,28 +388,28 @@ def scan_specific_portals_task(self, portal_ids: List[str]):
 def scan_all_portals_task():
     """Scan all configured portals."""
     all_portal_ids = list(PORTAL_CONFIGS.keys())
-    return scan_specific_portals_task.delay(all_portal_ids)  # type: ignore
+    return app.send_task('tasks.scan_specific_portals_task', args=[all_portal_ids])
 
 
 @app.task
 def scan_high_priority_portals():
     """Scan only high-traffic portals more frequently."""
     high_priority_ids = ['canadabuys', 'merx', 'toronto', 'ontario', 'bcbid', 'seao']
-    return scan_specific_portals_task.delay(high_priority_ids)  # type: ignore
+    return app.send_task('tasks.scan_specific_portals_task', args=[high_priority_ids])
 
 
 @app.task
 def scan_api_portals():
     """Scan portals with API access for real-time updates."""
     api_portal_ids = [k for k,v in PORTAL_CONFIGS.items() if v.get('type') in ['api', 'api_and_scrape']]
-    return scan_specific_portals_task.delay(api_portal_ids)  # type: ignore
+    return app.send_task('tasks.scan_specific_portals_task', args=[api_portal_ids])
 
 
 @app.task
 def scan_municipal_portals():
     """Scan all municipal portals."""
     municipal_ids = [k for k,v in PORTAL_CONFIGS.items() if 'City of' in v['name'] or 'Municipality' in v['name']]
-    return scan_specific_portals_task.delay(municipal_ids)  # type: ignore
+    return app.send_task('tasks.scan_specific_portals_task', args=[municipal_ids])
 
 
 @app.task
@@ -383,7 +419,7 @@ def scan_provincial_portals():
     provincial_ids = [k for k,v in PORTAL_CONFIGS.items() 
                       if any(keyword in v['name'] for keyword in provincial_keywords) 
                       and 'City' not in v['name']]
-    return scan_specific_portals_task.delay(provincial_ids)  # type: ignore
+    return app.send_task('tasks.scan_specific_portals_task', args=[provincial_ids])
 
 
 @app.task
@@ -618,14 +654,21 @@ def generate_weekly_summary():
         ).all()
         category_counts = {}
         for tender in tenders:
-            if tender.categories:
-                categories = json.loads(tender.categories)
-                for cat in categories:
-                    category_counts[cat] = category_counts.get(cat, 0) + 1
+            categories_str = tender.categories
+            if categories_str is not None and str(categories_str).strip() != '':
+                try:
+                    categories = json.loads(str(categories_str))
+                    for cat in categories:
+                        category_counts[cat] = category_counts.get(cat, 0) + 1
+                except (json.JSONDecodeError, TypeError):
+                    # Handle case where categories is not valid JSON
+                    continue
         
         weekly_stats['by_category'] = category_counts
         
-        logger.info(f"Weekly summary: {weekly_stats['total_new']} new tenders from {len(weekly_stats['by_portal'])} portals")
+        # Get the count of portals from the query result
+        portal_count = len(weekly_stats['by_portal']) if isinstance(weekly_stats['by_portal'], list) else 0
+        logger.info(f"Weekly summary: {weekly_stats['total_new']} new tenders from {portal_count} portals")
         return weekly_stats
         
     except Exception as e:
@@ -696,7 +739,7 @@ def analyze_tender_trends():
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=30)
         
-        trends: Dict[str, Any] = {
+        trends: dict[str, Any] = {
             'daily_counts': [],
             'portal_trends': {},
             'category_trends': {},

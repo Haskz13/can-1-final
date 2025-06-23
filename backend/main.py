@@ -28,12 +28,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from models import Base, SessionLocal, Tender, save_tender_to_db, get_db  # type: ignore[reportAny]
 
 # Import from selenium_utils module
-try:
-    from selenium_utils import selenium_manager, SeleniumGridManager
-except ImportError as e:
-    logger.error(f"Failed to import selenium_manager: {e}")
-    selenium_manager = None
-    SeleniumGridManager = None
+from selenium_utils import SeleniumGridManager
 
 from config import PORTAL_CONFIGS, TKA_COURSES
 from matcher import TenderMatcher
@@ -266,19 +261,23 @@ class ProcurementScanner:
     def __init__(self):
         """Initialize scanner with enhanced scrapers"""
         self.db = SessionLocal()
+        self.selenium = SeleniumGridManager()
         
         # Get MERX login credentials from environment variables
         merx_username = os.getenv('MERX_USERNAME')
         merx_password = os.getenv('MERX_PASSWORD')
         
-        # Initialize enhanced scrapers
+        # Initialize portal scanners
         self.portals = {
-            'MERX': MERXScraper(username=merx_username, password=merx_password),
+            'MERX': MERXScraper(username=os.getenv('MERX_USERNAME'), password=os.getenv('MERX_PASSWORD')),
             'CanadaBuys': CanadaBuysScraper(),
-            # Add more portals as needed
+            'BCBid': None,  # Handled by specific scan method
+            'SEAO': None,   # Handled by specific scan method
+            'Biddingo': None,  # Handled by specific scan method
+            'BidsAndTenders': None,  # Handled by specific scan method
         }
         
-        logger.info(f"Initialized scanner with {len(self.portals)} portals")
+        logger.info(f"Initialized scanner with {len(self.portals)} portal configurations")
         if merx_username:
             logger.info("MERX login credentials provided")
         else:
@@ -620,15 +619,8 @@ class ProcurementScanner:
     async def scan_merx(self) -> list[Dict]:
         """Scan MERX portal for training tenders with multiple search strategies"""
         final_tenders: list[Dict] = []
-        tenders: list[Dict] = []
-        driver = None
         
         try:
-            driver = await self.get_driver()
-            if not driver:
-                logger.error("Could not get driver for MERX")
-                return final_tenders
-            
             logger.info("Scanning MERX portal for training tenders...")
             
             # Multiple search strategies to find more tenders
@@ -641,342 +633,120 @@ class ProcurementScanner:
                 {"url": "https://www.merx.com/public/solicitations/open?keywords=professional", "description": "Professional keyword search"}
             ]
             
+            # Get driver for Selenium
+            driver = await self.get_driver()
+            if not driver:
+                logger.error("Could not get driver for MERX")
+                return final_tenders
+            
+            # Create MERX scraper instance
+            merx_scraper = MERXScraper()
+            merx_scraper.driver = driver
+            
+            # Training-related keywords to filter for (focus on services, not equipment/supplies)
+            training_keywords = [
+                # Core training and education services
+                "training", "education", "professional development", "learning",
+                "workshop", "seminar", "course", "curriculum", "instruction",
+                "teaching", "facilitation", "mentoring", "coaching", "certification",
+                "accreditation", "workshop", "conference", "symposium", "webinar",
+                "e-learning", "online learning", "distance learning", "virtual training",
+                
+                # Educational services and programs
+                "educational services", "training program", "learning program",
+                "professional training", "skill development", "capacity building",
+                "leadership development", "management training", "technical training",
+                "safety training", "compliance training", "regulatory training",
+                
+                # Education institutions (services they provide)
+                "school board", "school district", "university", "college", "academy",
+                "institute", "campus", "academic services", "educational consulting",
+                "curriculum development", "instructional design", "assessment",
+                "evaluation", "accreditation", "certification program",
+                
+                # Government education services
+                "ministry of education", "department of education", "education authority",
+                "public education", "post-secondary", "higher education",
+                "continuing education", "adult education", "vocational training",
+                "apprenticeship", "skills training", "workforce development",
+                
+                # Training delivery methods
+                "instructor", "trainer", "facilitator", "consultant", "coach",
+                "mentor", "tutor", "educator", "teacher", "professor",
+                "presenter", "speaker", "moderator", "coordinator",
+                
+                # Additional service keywords
+                "consulting", "advisory", "support", "services", "expertise",
+                "knowledge", "skills", "development", "improvement", "enhancement"
+            ]
+            
+            # Keywords to EXCLUDE (equipment, supplies, physical materials)
+            exclude_keywords = [
+                "equipment", "supplies", "materials", "furniture", "textbooks",
+                "books", "computers", "software", "hardware", "devices",
+                "instruments", "tools", "machinery", "vehicles", "construction",
+                "building", "maintenance", "repair", "installation", "purchase",
+                "procurement", "acquisition", "buy", "purchase", "lease",
+                "rental", "equipment rental", "supply contract", "materials contract"
+            ]
+            
             for strategy in search_strategies:
                 try:
                     logger.info(f"MERX search strategy: {strategy['description']}")
                     
-                    # Navigate to MERX search page
-                    if not self.selenium.stealth_navigation(driver, strategy['url']):
-                        logger.error(f"Failed to navigate to MERX: {strategy['url']}")
-                        continue
+                    # Use the MERX scraper with the correct URL
+                    search_query = "training AND services AND professional AND development AND upskilling"
+                    tenders = await merx_scraper.search(search_query, max_pages=5, search_url=strategy['url'])
                     
-                    # Handle cookie consent if present
-                    try:
-                        cookie_button = driver.find_element(By.CSS_SELECTOR, ".cookie-consent-buttons button, .accept-cookies, .cookie-accept")
-                        if cookie_button:
-                            cookie_button.click()
-                            await asyncio.sleep(2)
-                            logger.info("Accepted cookies")
-                    except Exception:
-                        pass  # No cookie banner found
-                    
-                    # Training-related keywords to filter for (focus on services, not equipment/supplies)
-                    training_keywords = [
-                        # Core training and education services
-                        "training", "education", "professional development", "learning",
-                        "workshop", "seminar", "course", "curriculum", "instruction",
-                        "teaching", "facilitation", "mentoring", "coaching", "certification",
-                        "accreditation", "workshop", "conference", "symposium", "webinar",
-                        "e-learning", "online learning", "distance learning", "virtual training",
-                        
-                        # Educational services and programs
-                        "educational services", "training program", "learning program",
-                        "professional training", "skill development", "capacity building",
-                        "leadership development", "management training", "technical training",
-                        "safety training", "compliance training", "regulatory training",
-                        
-                        # Education institutions (services they provide)
-                        "school board", "school district", "university", "college", "academy",
-                        "institute", "campus", "academic services", "educational consulting",
-                        "curriculum development", "instructional design", "assessment",
-                        "evaluation", "accreditation", "certification program",
-                        
-                        # Government education services
-                        "ministry of education", "department of education", "education authority",
-                        "public education", "post-secondary", "higher education",
-                        "continuing education", "adult education", "vocational training",
-                        "apprenticeship", "skills training", "workforce development",
-                        
-                        # Training delivery methods
-                        "instructor", "trainer", "facilitator", "consultant", "coach",
-                        "mentor", "tutor", "educator", "teacher", "professor",
-                        "presenter", "speaker", "moderator", "coordinator",
-                        
-                        # Additional service keywords
-                        "consulting", "advisory", "support", "services", "expertise",
-                        "knowledge", "skills", "development", "improvement", "enhancement"
-                    ]
-                    
-                    # Keywords to EXCLUDE (equipment, supplies, physical materials)
-                    exclude_keywords = [
-                        "equipment", "supplies", "materials", "furniture", "textbooks",
-                        "books", "computers", "software", "hardware", "devices",
-                        "instruments", "tools", "machinery", "vehicles", "construction",
-                        "building", "maintenance", "repair", "installation", "purchase",
-                        "procurement", "acquisition", "buy", "purchase", "lease",
-                        "rental", "equipment rental", "supply contract", "materials contract"
-                    ]
-                    
-                    # Process multiple pages to find training tenders
-                    max_pages = 20  # Increased to get more results
-                    page_tenders = []
-                    
-                    for page_num in range(1, max_pages + 1):
+                    # Filter tenders for training content
+                    training_tenders = []
+                    for tender_data in tenders:
                         try:
-                            logger.info(f"Processing MERX page {page_num} for strategy: {strategy['description']}")
+                            # Check if this tender is training-related
+                            title_lower = tender_data['title'].lower()
+                            description_lower = tender_data.get('description', '').lower()
                             
-                            # Wait for page to load
-                            WebDriverWait(driver, 15).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, "table, .results, .solicitation-item, tr"))
-                            )
+                            # First check if it contains training keywords
+                            is_training = any(keyword in title_lower or keyword in description_lower 
+                                             for keyword in training_keywords)
                             
-                            # Find tender elements on current page
-                            tender_elements = []
-                            selectors = [
-                                "tr[data-solicitation-id]",  # Table rows with solicitation data
-                                ".solicitation-item",         # Solicitation items
-                                ".opportunity-item",          # Opportunity items
-                                "tr:has(td)",                 # Table rows with cells
-                                ".result-item",               # Result items
-                                "a[href*='/solicitations/']", # Solicitation links
-                                "tr"                          # Any table row as fallback
-                            ]
+                            # Then check if it should be excluded (equipment/supplies)
+                            should_exclude = any(exclude_keyword in title_lower or exclude_keyword in description_lower 
+                                                for exclude_keyword in exclude_keywords)
                             
-                            for selector in selectors:
-                                elements = self.selenium.find_elements_safe(driver, By.CSS_SELECTOR, selector, timeout=5)  # type: ignore[arg-type]
-                                if elements:
-                                    tender_elements = elements
-                                    logger.info(f"Found {len(elements)} elements using selector: {selector}")
-                                    break
-                            
-                            # Parse tenders on current page and filter for training content
-                            page_count = 0
-                            training_count = 0
-                            
-                            for element in tender_elements:
-                                try:
-                                    tender_data = self._parse_merx_opportunity(element)
-                                    if tender_data:
-                                        page_count += 1
-                                        
-                                        # Check if this tender is training-related
-                                        title_lower = tender_data['title'].lower()
-                                        description_lower = tender_data.get('description', '').lower()
-                                        
-                                        # First check if it contains training keywords
-                                        is_training = any(keyword in title_lower or keyword in description_lower 
-                                                         for keyword in training_keywords)
-                                        
-                                        # Then check if it should be excluded (equipment/supplies)
-                                        should_exclude = any(exclude_keyword in title_lower or exclude_keyword in description_lower 
-                                                            for exclude_keyword in exclude_keywords)
-                                        
-                                        if is_training and not should_exclude:
-                                            # Add training keywords to the tender
-                                            found_keywords = [kw for kw in training_keywords 
-                                                             if kw in title_lower or kw in description_lower]
-                                            tender_data['keywords'] = found_keywords
-                                            tender_data['categories'] = ['Training', 'Education', 'Professional Development']
-                                            page_tenders.append(tender_data)
-                                            training_count += 1
-                                except Exception as e:
-                                    logger.warning(f"Error parsing MERX opportunity: {e}")
-                                    continue
-                            
-                            logger.info(f"Page {page_num}: Found {page_count} total tenders, {training_count} training-related")
-                            
-                            # Try to go to next page or load more results
-                            if page_num < max_pages:
-                                try:
-                                    # Look for "Load More" button
-                                    load_more_selectors = [
-                                        "button[class*='load-more']",
-                                        "button[class*='Load More']",
-                                        "a[class*='load-more']",
-                                        ".load-more",
-                                        "button:contains('Load More')",
-                                        "button:contains('Show More')",
-                                        "a:contains('Load More')",
-                                        "a:contains('Show More')"
-                                    ]
-                                    
-                                    load_more_clicked = False
-                                    for selector in load_more_selectors:
-                                        try:
-                                            load_more_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                                            if load_more_btn and load_more_btn.is_displayed():
-                                                driver.execute_script("arguments[0].click();", load_more_btn)
-                                                await asyncio.sleep(3)
-                                                logger.info(f"Clicked 'Load More' button on page {page_num}")
-                                                load_more_clicked = True
-                                                break
-                                        except:
-                                            continue
-                                    
-                                    # If no "Load More" button, try pagination
-                                    if not load_more_clicked:
-                                        pagination_selectors = [
-                                            "a[class*='next']",
-                                            "a[class*='Next']",
-                                            ".pagination .next",
-                                            ".pagination a[href*='page']",
-                                            "a[aria-label*='Next']",
-                                            "a[title*='Next']"
-                                        ]
-                                        
-                                        page_advanced = False
-                                        for selector in pagination_selectors:
-                                            try:
-                                                next_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                                                if next_btn and next_btn.is_displayed() and next_btn.is_enabled():
-                                                    driver.execute_script("arguments[0].click();", next_btn)
-                                                    await asyncio.sleep(3)
-                                                    logger.info(f"Clicked 'Next' button on page {page_num}")
-                                                    page_advanced = True
-                                                    break
-                                            except:
-                                                continue
-                                        
-                                        if not page_advanced:
-                                            # If no pagination found, try to construct next page URL
-                                            current_url = driver.current_url
-                                            if 'page=' in current_url:
-                                                # Replace page number
-                                                next_url = current_url.replace(f'page={page_num}', f'page={page_num + 1}')
-                                            else:
-                                                # Add page parameter
-                                                separator = '&' if '?' in current_url else '?'
-                                                next_url = f"{current_url}{separator}page={page_num + 1}"
-                                            
-                                            driver.get(next_url)
-                                            await asyncio.sleep(3)
-                                            logger.info(f"Navigated to next page URL: {next_url}")
-                                            page_advanced = True
-                                        
-                                        if not page_advanced:
-                                            logger.info(f"No more pages available for strategy: {strategy['description']}")
-                                            break
-                                    
-                                except Exception as e:
-                                    logger.warning(f"Error navigating to next page: {e}")
-                                    break  # Stop if we can't navigate further
-                            
+                            if is_training and not should_exclude:
+                                # Add training keywords to the tender
+                                found_keywords = [kw for kw in training_keywords 
+                                                 if kw in title_lower or kw in description_lower]
+                                tender_data['keywords'] = found_keywords
+                                tender_data['categories'] = ['Training', 'Education', 'Professional Development']
+                                training_tenders.append(tender_data)
                         except Exception as e:
-                            logger.error(f"Error processing MERX page {page_num}: {e}")
-                            break
+                            logger.warning(f"Error processing MERX tender: {e}")
+                            continue
                     
-                    # Add tenders from this strategy
-                    tenders.extend(page_tenders)
-                    logger.info(f"Strategy '{strategy['description']}': Found {len(page_tenders)} training tenders")
+                    logger.info(f"Strategy '{strategy['description']}': Found {len(tenders)} total tenders, {len(training_tenders)} training-related")
+                    final_tenders.extend(training_tenders)
                     
                 except Exception as e:
-                    logger.error(f"Error with MERX search strategy {strategy['description']}: {e}")
+                    logger.error(f"Error in MERX search strategy '{strategy['description']}': {e}")
                     continue
             
-            # Remove duplicates based on tender_id
-            seen_ids = set()
+            # Deduplicate results
             unique_tenders = []
-            for tender in tenders:
-                if tender['tender_id'] not in seen_ids:
-                    seen_ids.add(tender['tender_id'])
+            seen_ids = set()
+            for tender in final_tenders:
+                tender_id = tender.get('tender_id', '')
+                if tender_id not in seen_ids:
+                    seen_ids.add(tender_id)
                     unique_tenders.append(tender)
             
-            logger.info(f"Found {len(unique_tenders)} unique training tenders from MERX")
-            final_tenders = unique_tenders
+            logger.info(f"MERX scan complete: {len(final_tenders)} total tenders, {len(unique_tenders)} unique training tenders")
+            return unique_tenders
             
         except Exception as e:
             logger.error(f"Error scanning MERX: {e}")
-        finally:
-            if driver:
-                driver.quit()
-            
-        return final_tenders
-    
-    def _parse_merx_opportunity(self, element) -> Optional[Dict]:
-        """Parse MERX opportunity element with enhanced data extraction"""
-        try:
-            # Try to extract title from various possible locations
-            title = ""
-            title_selectors = [
-                "a", "h3", "h4", ".title", ".solicitation-title", 
-                "td:nth-child(1)", "td:nth-child(2)", ".result-title"
-            ]
-            
-            for selector in title_selectors:
-                try:
-                    title_elem = element.find_element(By.CSS_SELECTOR, selector)
-                    title = title_elem.text.strip()
-                    if title:
-                        break
-                except Exception:
-                    continue
-            
-            if not title:
-                # Fallback: get text from the element itself
-                title = element.text.strip()[:100]  # First 100 chars
-            
-            # Skip if title is too short or empty
-            if len(title) < 5:
-                return None
-    
-            # Extract organization
-            organization = "MERX"
-            org_selectors = [".organization", ".org", "td:nth-child(3)", ".result-org"]
-            for selector in org_selectors:
-                try:
-                    org_elem = element.find_element(By.CSS_SELECTOR, selector)
-                    org_text = org_elem.text.strip()
-                    if org_text:
-                        organization = org_text
-                        break
-                except Exception:
-                    continue
-            
-            # Extract URL
-            tender_url = ""
-            try:
-                link = element.find_element(By.CSS_SELECTOR, "a")
-                tender_url = link.get_attribute("href")
-            except:
-                # If no link found, construct a base URL
-                tender_url = "https://www.merx.com/public/solicitations/open?"
-            
-            # Extract additional data if available
-            location = ""
-            try:
-                location_elem = element.find_element(By.CSS_SELECTOR, ".location, td:nth-child(4)")
-                location = location_elem.text.strip()
-            except:
-                pass
-            
-            # Extract closing date if available
-            closing_date = None
-            try:
-                date_elem = element.find_element(By.CSS_SELECTOR, ".closing-date, .date, td:nth-child(5)")
-                date_text = date_elem.text.strip()
-                if date_text:
-                    # Try to parse the date
-                    try:
-                        closing_date = datetime.strptime(date_text, "%Y/%m/%d")
-                    except:
-                        pass
-            except:
-                pass
-            
-            # Generate unique ID
-            tender_id = f"MERX_{hashlib.md5((title + tender_url).encode()).hexdigest()[:8]}"
-            
-            return {
-                'tender_id': tender_id,
-                'title': title,
-                'organization': organization,
-                'portal': 'MERX',
-                'portal_url': 'https://www.merx.com',
-                'value': 0.0,
-                'closing_date': closing_date,
-                'posted_date': datetime.utcnow(),
-                'description': f"Tender from MERX portal",
-                'location': location,
-                'categories': [],
-                'keywords': [],
-                'tender_url': tender_url,
-                'documents_url': tender_url,
-                'is_active': True
-            }
-            
-        except Exception as e:
-            logger.warning(f"Error parsing MERX opportunity: {e}")
-            return None
+            return final_tenders
     
     async def scan_bcbid(self) -> list[Dict]:
         """Scan BC Bid portal"""
@@ -1337,52 +1107,94 @@ class ProcurementScanner:
             try:
                 portal_tenders = []
                 
-                # Execute multiple search strategies for each portal
-                for strategy_name, queries in search_strategies.items():
-                    logger.info(f"Executing {strategy_name} strategy on {portal_name}")
-                    
-                    for query in queries:
-                        try:
-                            # Select appropriate query format for each portal
-                            if portal_name.lower() == 'canadabuys':
-                                # Use quoted searches for CanadaBuys
-                                if 'AND' not in query:  # Use quoted format
-                                    formatted_query = query
-                                else:
-                                    # Convert AND format to quoted format for CanadaBuys
-                                    keywords = query.replace(' AND ', ' ').split()
-                                    formatted_query = ' '.join([f'"{kw}"' for kw in keywords])
-                            elif portal_name.lower() == 'merx':
-                                # Use AND searches for MERX
-                                if 'AND' in query:  # Use AND format
-                                    formatted_query = query
-                                else:
-                                    # Convert quoted format to AND format for MERX
-                                    keywords = query.replace('"', '').split()
-                                    formatted_query = ' AND '.join(keywords)
-                            else:
-                                formatted_query = query
-                            
-                            logger.info(f"Searching {portal_name} with query: '{formatted_query}' (original: '{query}')")
-                            results = await portal_scanner.search(formatted_query)
-                            
-                            # Score and enhance results
-                            scored_results = []
-                            for result in results:
-                                scored_result = {
-                                    **result,
-                                    'relevance_score': score_tender_relevance(result),
-                                    'search_strategy': strategy_name,
-                                    'search_query': query
-                                }
-                                scored_results.append(scored_result)
-                            
-                            portal_tenders.extend(scored_results)
-                            logger.info(f"Found {len(scored_results)} results for query '{formatted_query}' on {portal_name}")
-                            
-                        except Exception as e:
-                            logger.warning(f"Search failed for '{query}' on {portal_name}: {e}")
+                # Handle different portal types
+                if portal_scanner is None:
+                    # Use specific scan methods for portals without scraper instances
+                    try:
+                        if portal_name == 'BCBid':
+                            logger.info("Scanning BC Bid using scan_bcbid method")
+                            portal_tenders = await self.scan_bcbid()
+                        elif portal_name == 'SEAO':
+                            logger.info("Scanning SEAO using scan_seao_web method")
+                            portal_tenders = await self.scan_seao_web()
+                        elif portal_name == 'Biddingo':
+                            logger.info("Scanning Biddingo using scan_biddingo method")
+                            # Use a default config for Biddingo
+                            config = {'name': 'Biddingo', 'url': 'https://www.biddingo.com'}
+                            portal_tenders = await self.scan_biddingo('Biddingo', config)
+                        elif portal_name == 'BidsAndTenders':
+                            logger.info("Scanning Bids&Tenders using scan_bidsandtenders_portal method")
+                            # Use a default search URL for Bids&Tenders
+                            search_url = 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all'
+                            portal_tenders = await self.scan_bidsandtenders_portal('Bids&Tenders', search_url)
+                        else:
+                            logger.warning(f"No scanner available for portal: {portal_name}")
                             continue
+                    except Exception as e:
+                        logger.error(f"Error scanning {portal_name} with specific method: {e}")
+                        continue
+                else:
+                    # Use the scraper instance for portals with dedicated scrapers
+                    # Execute multiple search strategies for each portal
+                    for strategy_name, queries in search_strategies.items():
+                        logger.info(f"Executing {strategy_name} strategy on {portal_name}")
+                        
+                        for query in queries:
+                            try:
+                                # Add timeout to prevent getting stuck
+                                import asyncio
+                                
+                                # Select appropriate query format for each portal
+                                if portal_name.lower() == 'canadabuys':
+                                    # Use quoted searches for CanadaBuys
+                                    if 'AND' not in query:  # Use quoted format
+                                        formatted_query = query
+                                    else:
+                                        # Convert AND format to quoted format for CanadaBuys
+                                        keywords = query.replace(' AND ', ' ').split()
+                                        formatted_query = ' '.join([f'"{kw}"' for kw in keywords])
+                                elif portal_name.lower() == 'merx':
+                                    # Use AND searches for MERX
+                                    if 'AND' in query:  # Use AND format
+                                        formatted_query = query
+                                    else:
+                                        # Convert quoted format to AND format for MERX
+                                        keywords = query.replace('"', '').split()
+                                        formatted_query = ' AND '.join(keywords)
+                                else:
+                                    formatted_query = query
+                                
+                                logger.info(f"Searching {portal_name} with query: '{formatted_query}' (original: '{query}')")
+                                
+                                # Add timeout to search operation
+                                search_task = asyncio.create_task(portal_scanner.search(formatted_query))
+                                try:
+                                    # Use shorter timeout for MERX to prevent blocking other portals
+                                    timeout = 60 if portal_name.lower() == 'merx' else 180  # 1 minute for MERX, 3 minutes for others
+                                    results = await asyncio.wait_for(search_task, timeout=timeout)
+                                except asyncio.TimeoutError:
+                                    logger.warning(f"Search for '{formatted_query}' on {portal_name} timed out - skipping")
+                                    if not search_task.done():
+                                        search_task.cancel()
+                                    continue
+                                
+                                # Score and enhance results
+                                scored_results = []
+                                for result in results:
+                                    scored_result = {
+                                        **result,
+                                        'relevance_score': score_tender_relevance(result),
+                                        'search_strategy': strategy_name,
+                                        'search_query': query
+                                    }
+                                    scored_results.append(scored_result)
+                                
+                                portal_tenders.extend(scored_results)
+                                logger.info(f"Found {len(scored_results)} results for query '{formatted_query}' on {portal_name}")
+                                
+                            except Exception as e:
+                                logger.warning(f"Search failed for '{query}' on {portal_name}: {e}")
+                                continue
                 
                 # Deduplicate and sort by relevance for this portal
                 unique_portal_tenders = deduplicate_tenders(portal_tenders)
@@ -1434,16 +1246,14 @@ class ProcurementScanner:
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting procurement scanner...")
-    
+
     # Wait for Selenium Grid to be ready
-    if selenium_manager is not None:
-        if not selenium_manager.wait_for_grid_ready():
-            logger.error("Selenium Grid failed to start, but continuing...")
-    else:
-        logger.error("selenium_manager not available, skipping Selenium Grid check")
-    
+    selenium_grid = SeleniumGridManager()
+    if not selenium_grid.wait_for_grid_ready():
+        logger.error("Selenium Grid failed to start, but continuing...")
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down procurement scanner...")
 
@@ -1554,6 +1364,7 @@ async def get_statistics(db: Session = Depends(get_db)):
 @app.post("/api/scan")
 async def trigger_scan(background_tasks: BackgroundTasks):
     """Trigger a manual scan of all portals"""
+    # Use the existing scan method for now
     background_tasks.add_task(scan_all_portals)
     return {"message": "Scan initiated"}
 

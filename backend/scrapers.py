@@ -13,6 +13,7 @@ import asyncio
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,7 @@ class ProvincialScrapers:
         return tenders
     
     @staticmethod
-    async def scan_saskatchewan_tenders(driver, selenium_helper) -> List[Dict]:
+    async def scan_saskatchewan_tenders(driver, selenium_helper) -> List[Dict]:  # type: ignore
         """Scan SaskTenders"""
         tenders = []
         
@@ -189,7 +190,7 @@ class ProvincialScrapers:
                             'closing_date': None,
                             'posted_date': datetime.utcnow(),
                             'location': 'Manitoba',
-                            'tender_url': 'https://www.gov.mb.ca' + link.get('href', ''),
+                            'tender_url': 'https://www.gov.mb.ca' + str(link.get('href', '')),
                             'description': '',
                             'categories': [],
                             'keywords': []
@@ -864,7 +865,7 @@ class MERXScraper:
         self.driver = None
         self.is_logged_in = False
         
-    async def search(self, query, max_pages=5):
+    async def search(self, query, max_pages=5, search_url=None):
         """Enhanced search with multiple strategies and pagination"""
         logger.info(f"Starting enhanced MERX search for: {query}")
         
@@ -874,7 +875,33 @@ class MERXScraper:
         all_tenders = []
         
         try:
-            # --- Format query for MERX: Use AND between keywords ---
+            # Add timeout to prevent getting stuck
+            import asyncio
+            search_task = asyncio.create_task(self._perform_search(query, max_pages, search_url))
+            
+            try:
+                # Wait for search to complete with timeout
+                all_tenders = await asyncio.wait_for(search_task, timeout=300)  # 5 minute timeout
+            except asyncio.TimeoutError:
+                logger.warning("MERX search timed out after 5 minutes - returning partial results")
+                # Cancel the task if it's still running
+                if not search_task.done():
+                    search_task.cancel()
+                # Return whatever we have so far
+                return all_tenders
+                
+        except Exception as e:
+            logger.error(f"Error during MERX search: {e}")
+        
+        logger.info(f"MERX search complete: {len(all_tenders)} total tenders found")
+        return all_tenders
+    
+    async def _perform_search(self, query, max_pages=5, search_url=None):
+        """Internal search method with timeout protection"""
+        all_tenders = []
+        
+        try:
+            # Format query for MERX
             if isinstance(query, (list, tuple)):
                 query_str = ' '.join(query)
             else:
@@ -886,9 +913,14 @@ class MERXScraper:
                 query_str = ' AND '.join(keywords)
             logger.info(f"Using MERX search query: {query_str}")
             
+            # Use the provided search_url or fall back to default
+            if search_url:
+                target_url = search_url
+            else:
+                target_url = "https://www.merx.com/public/solicitations/open?"
+            
             # Navigate to MERX search page
-            search_url = "https://www.merx.com/gov/tender-opportunities"
-            self.driver.get(search_url)
+            self.driver.get(target_url)
             await asyncio.sleep(3)
             
             # Debug: Log the current page title and URL
@@ -898,11 +930,14 @@ class MERXScraper:
             # Handle cookie consent
             await self._handle_cookie_consent()
             
-            # Try to login if credentials provided
+            # Try to login if credentials provided (with timeout)
             if self.username and self.password:
                 logger.info("Attempting to login to MERX")
                 try:
-                    await self._login()
+                    login_task = asyncio.create_task(self._login())
+                    await asyncio.wait_for(login_task, timeout=60)  # 1 minute timeout for login
+                except asyncio.TimeoutError:
+                    logger.warning("Login timed out - continuing with public access")
                 except Exception as e:
                     logger.error(f"Error during login: {e}")
                     logger.warning("Continuing with public access")
@@ -910,7 +945,7 @@ class MERXScraper:
             # Check if we're on a login page or 404
             if "login" in self.driver.title.lower() or "error" in self.driver.title.lower():
                 logger.warning("Redirected to login page or error page - trying alternative URL")
-                alternative_url = "https://www.merx.com/gov/tenders"
+                alternative_url = "https://www.merx.com/public/solicitations/open?"
                 self.driver.get(alternative_url)
                 await asyncio.sleep(3)
                 logger.info(f"Alternative page: {self.driver.title}")
@@ -1059,7 +1094,6 @@ class MERXScraper:
         except Exception as e:
             logger.error(f"Error during MERX search: {e}")
         
-        logger.info(f"MERX search complete: {len(all_tenders)} total tenders found")
         return all_tenders
     
     async def _scrape_all_open_solicitations(self, max_pages=5, query=""):
@@ -1226,7 +1260,12 @@ class MERXScraper:
             # Handle cookie consent before login
             await self._handle_cookie_consent()
             
-            # Find username field
+            # Check if we're already on a login page
+            if "login" not in self.driver.title.lower() and "sign in" not in self.driver.title.lower():
+                logger.info("Not on login page, may already be logged in or redirected")
+                return
+            
+            # Find username field with better error handling
             username_selectors = [
                 "input[name='j_username']",
                 "input[name='username']",
@@ -1241,16 +1280,18 @@ class MERXScraper:
             for selector in username_selectors:
                 try:
                     username_field = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if username_field.is_displayed():
+                    if username_field.is_displayed() and username_field.is_enabled():
+                        logger.info(f"Found username field with selector: {selector}")
                         break
-                except:
+                except Exception as e:
+                    logger.debug(f"Username selector {selector} failed: {e}")
                     continue
             
             if not username_field:
-                logger.error("Could not find username field")
+                logger.warning("Could not find username field - skipping login")
                 return
             
-            # Find password field
+            # Find password field with better error handling
             password_selectors = [
                 "input[name='j_password']",
                 "input[name='password']",
@@ -1263,25 +1304,36 @@ class MERXScraper:
             for selector in password_selectors:
                 try:
                     password_field = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if password_field.is_displayed():
+                    if password_field.is_displayed() and password_field.is_enabled():
+                        logger.info(f"Found password field with selector: {selector}")
                         break
-                except:
+                except Exception as e:
+                    logger.debug(f"Password selector {selector} failed: {e}")
                     continue
             
             if not password_field:
-                logger.error("Could not find password field")
+                logger.warning("Could not find password field - skipping login")
                 return
             
-            # Enter credentials
-            username_field.clear()
-            username_field.send_keys(self.username)
-            await asyncio.sleep(1)
+            # Enter credentials with better error handling
+            try:
+                # Clear fields first
+                username_field.clear()
+                await asyncio.sleep(0.5)
+                username_field.send_keys(self.username)
+                await asyncio.sleep(0.5)
+                
+                password_field.clear()
+                await asyncio.sleep(0.5)
+                password_field.send_keys(self.password)
+                await asyncio.sleep(0.5)
+                
+                logger.info("Credentials entered successfully")
+            except Exception as e:
+                logger.warning(f"Error entering credentials: {e} - skipping login")
+                return
             
-            password_field.clear()
-            password_field.send_keys(self.password)
-            await asyncio.sleep(1)
-            
-            # Find and click login button
+            # Find and click login button with better error handling
             login_selectors = [
                 "button[type='submit']",
                 "input[type='submit']",
@@ -1299,19 +1351,40 @@ class MERXScraper:
                 try:
                     login_button = self.driver.find_element(By.CSS_SELECTOR, selector)
                     if login_button.is_displayed() and login_button.is_enabled():
+                        logger.info(f"Found login button with selector: {selector}")
                         break
-                except:
+                except Exception as e:
+                    logger.debug(f"Login button selector {selector} failed: {e}")
                     continue
             
             if not login_button:
-                logger.error("Could not find login button")
-                return
-            
-            # Click login button
-            login_button.click()
-            await asyncio.sleep(3)
+                logger.warning("Could not find login button - trying Enter key")
+                try:
+                    from selenium.webdriver.common.keys import Keys
+                    password_field.send_keys(Keys.RETURN)
+                    await asyncio.sleep(3)
+                    logger.info("Submitted login with Enter key")
+                except Exception as e:
+                    logger.warning(f"Enter key submission failed: {e} - skipping login")
+                    return
+            else:
+                # Click login button with better error handling
+                try:
+                    login_button.click()
+                    await asyncio.sleep(3)
+                    logger.info("Clicked login button")
+                except Exception as e:
+                    logger.warning(f"Login button click failed: {e} - trying JavaScript click")
+                    try:
+                        self.driver.execute_script("arguments[0].click();", login_button)
+                        await asyncio.sleep(3)
+                        logger.info("Login button clicked via JavaScript")
+                    except Exception as e2:
+                        logger.warning(f"JavaScript click also failed: {e2} - skipping login")
+                        return
             
             # Check if login was successful
+            await asyncio.sleep(2)
             if "login" not in self.driver.title.lower() and "sign in" not in self.driver.title.lower():
                 self.is_logged_in = True
                 logger.info("Successfully logged in to MERX")
@@ -2547,3 +2620,877 @@ class CanadaBuysScraper:
             return email, phone
         except:
             return None, None
+
+class BidsAndTendersScraper:
+    """Scraper for Bids&Tenders portal"""
+    
+    def __init__(self):
+        """Initialize Bids&Tenders scraper"""
+        self.base_url = "https://www.bidsandtenders.ca"
+        self.search_url = "https://www.bidsandtenders.ca/section/opportunities/opportunities.asp"
+        
+    async def search(self, query, max_pages=5):
+        """Search Bids&Tenders portal with multiple strategies"""
+        tenders = []
+        
+        try:
+            driver = await self._setup_driver()
+            if not driver:
+                logger.error("Could not setup driver for Bids&Tenders")
+                return tenders
+            
+            # Handle cookie consent
+            await self._handle_cookie_consent(driver)
+            
+            # Search strategies for Bids&Tenders
+            search_strategies = [
+                {"term": query, "description": f"Direct search: {query}"},
+                {"term": "training services", "description": "Training services"},
+                {"term": "professional development", "description": "Professional development"},
+                {"term": "consulting services", "description": "Consulting services"},
+                {"term": "education services", "description": "Education services"},
+                {"term": "", "description": "All opportunities"}  # No search term
+            ]
+            
+            for strategy in search_strategies:
+                try:
+                    logger.info(f"Bids&Tenders search strategy: {strategy['description']}")
+                    strategy_tenders = await self._scrape_opportunities(driver, strategy['term'], max_pages)
+                    tenders.extend(strategy_tenders)
+                    logger.info(f"Found {len(strategy_tenders)} tenders for strategy: {strategy['description']}")
+                except Exception as e:
+                    logger.warning(f"Strategy failed for Bids&Tenders: {e}")
+                    continue
+            
+            driver.quit()
+            
+        except Exception as e:
+            logger.error(f"Error in Bids&Tenders search: {e}")
+            
+        return tenders
+    
+    async def _setup_driver(self):
+        """Setup Selenium WebDriver"""
+        try:
+            from selenium_utils import get_driver
+            return get_driver()
+        except Exception as e:
+            logger.error(f"Error setting up driver: {e}")
+            return None
+    
+    async def _handle_cookie_consent(self, driver):
+        """Handle cookie consent popup"""
+        try:
+            cookie_selectors = [
+                "button[class*='accept']",
+                "button[class*='Accept']",
+                "button[class*='cookie']",
+                "button[class*='Cookie']",
+                ".cookie-accept",
+                ".accept-cookies",
+                "button:contains('Accept')",
+                "button:contains('Accept All')"
+            ]
+            
+            for selector in cookie_selectors:
+                try:
+                    cookie_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                    if cookie_btn and cookie_btn.is_displayed():
+                        cookie_btn.click()
+                        await asyncio.sleep(2)
+                        logger.info("Accepted cookies on Bids&Tenders")
+                        break
+                except:
+                    continue
+        except Exception as e:
+            logger.warning(f"Error handling cookie consent: {e}")
+    
+    async def _scrape_opportunities(self, driver, query, max_pages):
+        """Scrape opportunities from Bids&Tenders"""
+        tenders = []
+        
+        try:
+            # Navigate to search page
+            search_params = {
+                'type': '1',
+                'show': 'all',
+                'rregion': 'ALL'
+            }
+            
+            if query:
+                search_params['keys'] = query
+            
+            # Build search URL
+            search_url = f"{self.search_url}?{'&'.join([f'{k}={v}' for k, v in search_params.items()])}"
+            driver.get(search_url)
+            await asyncio.sleep(3)
+            
+            # Process multiple pages
+            for page in range(1, max_pages + 1):
+                try:
+                    logger.info(f"Processing Bids&Tenders page {page}")
+                    
+                    # Extract tenders from current page
+                    page_tenders = await self._extract_tenders_from_page(driver)
+                    tenders.extend(page_tenders)
+                    
+                    # Try to go to next page
+                    if page < max_pages:
+                        next_page_clicked = await self._go_to_next_page(driver)
+                        if not next_page_clicked:
+                            logger.info("No more pages available")
+                            break
+                    
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing page {page}: {e}")
+                    break
+            
+        except Exception as e:
+            logger.error(f"Error scraping Bids&Tenders opportunities: {e}")
+        
+        return tenders
+    
+    async def _extract_tenders_from_page(self, driver):
+        """Extract tender information from current page"""
+        tenders = []
+        
+        try:
+            # Look for tender listings
+            tender_selectors = [
+                ".opportunity-item",
+                ".tender-item",
+                ".bid-item",
+                "tr[class*='opportunity']",
+                "tr[class*='tender']",
+                "tr[class*='bid']",
+                ".result-item",
+                "div[class*='opportunity']",
+                "div[class*='tender']"
+            ]
+            
+            tender_elements = []
+            for selector in tender_selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        tender_elements = elements
+                        logger.info(f"Found {len(elements)} tender elements using selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            # Parse each tender element
+            for element in tender_elements[:50]:  # Limit to 50 per page
+                try:
+                    tender_data = await self._parse_tender_element(element)
+                    if tender_data:
+                        tenders.append(tender_data)
+                except Exception as e:
+                    logger.warning(f"Error parsing tender element: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Error extracting tenders from page: {e}")
+        
+        return tenders
+    
+    async def _parse_tender_element(self, element):
+        """Parse individual tender element"""
+        try:
+            # Extract basic information
+            title = self._extract_text(element, [
+                "h3", "h4", ".title", ".opportunity-title", ".tender-title",
+                "td:nth-child(2)", "td:nth-child(1)"
+            ])
+            
+            if not title:
+                return None
+            
+            # Extract organization
+            organization = self._extract_text(element, [
+                ".organization", ".org", ".company", ".agency",
+                "td:nth-child(3)", "td:nth-child(2)"
+            ]) or "Unknown Organization"
+            
+            # Extract tender ID
+            tender_id = self._extract_tender_id(element, title)
+            
+            # Extract dates
+            closing_date = await self._extract_date(element, [
+                ".closing-date", ".deadline", ".due-date",
+                "td:nth-child(4)", "td:nth-child(5)"
+            ])
+            
+            posted_date = await self._extract_date(element, [
+                ".posted-date", ".publish-date", ".issue-date",
+                "td:nth-child(3)", "td:nth-child(4)"
+            ]) or datetime.utcnow()
+            
+            # Extract value
+            value = await self._extract_value(element)
+            
+            # Extract URL
+            tender_url = self._extract_url(element)
+            
+            # Extract description
+            description = self._extract_text(element, [
+                ".description", ".summary", ".details",
+                "td:nth-child(6)", "td:nth-child(7)"
+            ]) or ""
+            
+            tender = {
+                'tender_id': tender_id,
+                'title': title,
+                'organization': organization,
+                'portal': 'Bids&Tenders',
+                'value': value,
+                'closing_date': closing_date,
+                'posted_date': posted_date,
+                'location': 'Canada',
+                'tender_url': tender_url,
+                'description': description,
+                'categories': [],
+                'keywords': self._extract_keywords(title, description),
+                'matching_courses': self._extract_matching_courses(title, description),
+                'priority': self._determine_priority(title, description)
+            }
+            
+            return tender
+            
+        except Exception as e:
+            logger.warning(f"Error parsing tender element: {e}")
+            return None
+    
+    def _extract_text(self, element, selectors):
+        """Extract text from element using multiple selectors"""
+        for selector in selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return found.text.strip()
+            except:
+                continue
+        return ""
+    
+    def _extract_tender_id(self, element, title):
+        """Extract tender ID from element or generate from title"""
+        # Try to find tender ID in various locations
+        id_selectors = [
+            ".tender-id", ".opportunity-id", ".bid-id",
+            "td:nth-child(1)", "td:first-child"
+        ]
+        
+        for selector in id_selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return found.text.strip()
+            except:
+                continue
+        
+        # Generate ID from title
+        return hashlib.md5(title.encode()).hexdigest()[:8]
+    
+    async def _extract_date(self, element, selectors):
+        """Extract date from element"""
+        for selector in selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return parse_date(found.text.strip())
+            except:
+                continue
+        return None
+    
+    async def _extract_value(self, element):
+        """Extract monetary value from element"""
+        value_selectors = [
+            ".value", ".amount", ".budget", ".estimated-value",
+            "td:nth-child(5)", "td:nth-child(6)"
+        ]
+        
+        for selector in value_selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return parse_value(found.text.strip())
+            except:
+                continue
+        return 0.0
+    
+    def _extract_url(self, element):
+        """Extract tender URL from element"""
+        try:
+            # Look for links
+            links = element.find_elements(By.TAG_NAME, "a")
+            for link in links:
+                href = link.get_attribute('href')
+                if href and ('opportunity' in href or 'tender' in href or 'bid' in href):
+                    return href
+        except:
+            pass
+        
+        return self.base_url
+    
+    def _extract_keywords(self, title, description):
+        """Extract keywords from title and description"""
+        text = f"{title} {description}".lower()
+        keywords = []
+        
+        # Training-related keywords
+        training_keywords = [
+            'training', 'education', 'learning', 'development', 'workshop',
+            'seminar', 'course', 'certification', 'professional development',
+            'skill development', 'capacity building', 'upskilling', 'reskilling'
+        ]
+        
+        for keyword in training_keywords:
+            if keyword in text:
+                keywords.append(keyword)
+        
+        return keywords
+    
+    def _extract_matching_courses(self, title, description):
+        """Extract matching courses from title and description"""
+        text = f"{title} {description}".lower()
+        matching_courses = []
+        
+        # Map keywords to TKA courses
+        course_mapping = {
+            'project management': 'Project Management',
+            'leadership': 'Leadership',
+            'communication': 'Communication',
+            'negotiation': 'Negotiation',
+            'contract management': 'Contract Management',
+            'procurement': 'Procurement',
+            'supply chain': 'Supply Chain',
+            'risk management': 'Risk Management',
+            'strategic planning': 'Strategic Planning',
+            'change management': 'Change Management',
+            'team building': 'Team Building',
+            'conflict resolution': 'Conflict Resolution',
+            'time management': 'Time Management',
+            'problem solving': 'Problem Solving',
+            'decision making': 'Decision Making',
+            'financial management': 'Financial Management',
+            'human resources': 'Human Resources',
+            'marketing': 'Marketing',
+            'sales': 'Sales',
+            'customer service': 'Customer Service',
+            'quality management': 'Quality Management',
+            'process improvement': 'Process Improvement',
+            'innovation': 'Innovation',
+            'digital transformation': 'Digital Transformation',
+            'data analysis': 'Data Analysis',
+            'business intelligence': 'Business Intelligence',
+            'cybersecurity': 'Cybersecurity',
+            'cloud computing': 'Cloud Computing',
+            'agile': 'Agile',
+            'scrum': 'Scrum',
+            'lean six sigma': 'Lean Six Sigma',
+            'iso': 'ISO Standards',
+            'compliance': 'Compliance',
+            'regulatory': 'Regulatory Affairs'
+        }
+        
+        for keyword, course in course_mapping.items():
+            if keyword in text:
+                matching_courses.append(course)
+        
+        return matching_courses
+    
+    def _determine_priority(self, title, description):
+        """Determine priority based on content"""
+        text = f"{title} {description}".lower()
+        
+        # High priority keywords
+        high_priority = [
+            'training', 'education', 'learning', 'development', 'workshop',
+            'seminar', 'course', 'certification', 'professional development',
+            'consulting', 'advisory', 'implementation', 'change management'
+        ]
+        
+        # Medium priority keywords
+        medium_priority = [
+            'service', 'support', 'maintenance', 'management', 'administration',
+            'coordination', 'facilitation', 'delivery', 'provision'
+        ]
+        
+        for keyword in high_priority:
+            if keyword in text:
+                return 'high'
+        
+        for keyword in medium_priority:
+            if keyword in text:
+                return 'medium'
+        
+        return 'low'
+    
+    async def _go_to_next_page(self, driver):
+        """Navigate to next page"""
+        try:
+            next_selectors = [
+                "a[class*='next']",
+                "a[class*='Next']",
+                ".pagination .next",
+                "a[aria-label*='Next']",
+                "a[title*='Next']",
+                "a:contains('Next')",
+                "a:contains('>')"
+            ]
+            
+            for selector in next_selectors:
+                try:
+                    next_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                    if next_btn and next_btn.is_displayed() and next_btn.is_enabled():
+                        driver.execute_script("arguments[0].click();", next_btn)
+                        await asyncio.sleep(3)
+                        logger.info("Navigated to next page")
+                        return True
+                except:
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error navigating to next page: {e}")
+            return False
+
+
+class BiddingoScraper:
+    """Scraper for Biddingo portal"""
+    
+    def __init__(self):
+        """Initialize Biddingo scraper"""
+        self.base_url = "https://www.biddingo.com"
+        self.search_url = "https://www.biddingo.com/search"
+        
+    async def search(self, query, max_pages=5):
+        """Search Biddingo portal with multiple strategies"""
+        tenders = []
+        
+        try:
+            driver = await self._setup_driver()
+            if not driver:
+                logger.error("Could not setup driver for Biddingo")
+                return tenders
+            
+            # Handle cookie consent
+            await self._handle_cookie_consent(driver)
+            
+            # Search strategies for Biddingo
+            search_strategies = [
+                {"term": query, "description": f"Direct search: {query}"},
+                {"term": "training services", "description": "Training services"},
+                {"term": "professional development", "description": "Professional development"},
+                {"term": "consulting services", "description": "Consulting services"},
+                {"term": "education services", "description": "Education services"},
+                {"term": "", "description": "All opportunities"}  # No search term
+            ]
+            
+            for strategy in search_strategies:
+                try:
+                    logger.info(f"Biddingo search strategy: {strategy['description']}")
+                    strategy_tenders = await self._scrape_opportunities(driver, strategy['term'], max_pages)
+                    tenders.extend(strategy_tenders)
+                    logger.info(f"Found {len(strategy_tenders)} tenders for strategy: {strategy['description']}")
+                except Exception as e:
+                    logger.warning(f"Strategy failed for Biddingo: {e}")
+                    continue
+            
+            driver.quit()
+            
+        except Exception as e:
+            logger.error(f"Error in Biddingo search: {e}")
+            
+        return tenders
+    
+    async def _setup_driver(self):
+        """Setup Selenium WebDriver"""
+        try:
+            from selenium_utils import get_driver
+            return get_driver()
+        except Exception as e:
+            logger.error(f"Error setting up driver: {e}")
+            return None
+    
+    async def _handle_cookie_consent(self, driver):
+        """Handle cookie consent popup"""
+        try:
+            cookie_selectors = [
+                "button[class*='accept']",
+                "button[class*='Accept']",
+                "button[class*='cookie']",
+                "button[class*='Cookie']",
+                ".cookie-accept",
+                ".accept-cookies",
+                "button:contains('Accept')",
+                "button:contains('Accept All')"
+            ]
+            
+            for selector in cookie_selectors:
+                try:
+                    cookie_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                    if cookie_btn and cookie_btn.is_displayed():
+                        cookie_btn.click()
+                        await asyncio.sleep(2)
+                        logger.info("Accepted cookies on Biddingo")
+                        break
+                except:
+                    continue
+        except Exception as e:
+            logger.warning(f"Error handling cookie consent: {e}")
+    
+    async def _scrape_opportunities(self, driver, query, max_pages):
+        """Scrape opportunities from Biddingo"""
+        tenders = []
+        
+        try:
+            # Navigate to search page
+            if query:
+                search_url = f"{self.search_url}?q={query}"
+            else:
+                search_url = f"{self.base_url}/opportunities"
+            
+            driver.get(search_url)
+            await asyncio.sleep(3)
+            
+            # Process multiple pages
+            for page in range(1, max_pages + 1):
+                try:
+                    logger.info(f"Processing Biddingo page {page}")
+                    
+                    # Extract tenders from current page
+                    page_tenders = await self._extract_tenders_from_page(driver)
+                    tenders.extend(page_tenders)
+                    
+                    # Try to go to next page
+                    if page < max_pages:
+                        next_page_clicked = await self._go_to_next_page(driver)
+                        if not next_page_clicked:
+                            logger.info("No more pages available")
+                            break
+                    
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing page {page}: {e}")
+                    break
+            
+        except Exception as e:
+            logger.error(f"Error scraping Biddingo opportunities: {e}")
+        
+        return tenders
+    
+    async def _extract_tenders_from_page(self, driver):
+        """Extract tender information from current page"""
+        tenders = []
+        
+        try:
+            # Look for tender listings
+            tender_selectors = [
+                ".opportunity-item",
+                ".tender-item",
+                ".bid-item",
+                ".listing-item",
+                ".result-item",
+                "div[class*='opportunity']",
+                "div[class*='tender']",
+                "div[class*='bid']",
+                "div[class*='listing']",
+                "article",
+                ".card",
+                ".item"
+            ]
+            
+            tender_elements = []
+            for selector in tender_selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        tender_elements = elements
+                        logger.info(f"Found {len(elements)} tender elements using selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            # Parse each tender element
+            for element in tender_elements[:50]:  # Limit to 50 per page
+                try:
+                    tender_data = await self._parse_tender_element(element)
+                    if tender_data:
+                        tenders.append(tender_data)
+                except Exception as e:
+                    logger.warning(f"Error parsing tender element: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Error extracting tenders from page: {e}")
+        
+        return tenders
+    
+    async def _parse_tender_element(self, element):
+        """Parse individual tender element"""
+        try:
+            # Extract basic information
+            title = self._extract_text(element, [
+                "h3", "h4", ".title", ".opportunity-title", ".tender-title",
+                ".item-title", ".listing-title", ".card-title"
+            ])
+            
+            if not title:
+                return None
+            
+            # Extract organization
+            organization = self._extract_text(element, [
+                ".organization", ".org", ".company", ".agency", ".client",
+                ".buyer", ".purchaser", ".issuer"
+            ]) or "Unknown Organization"
+            
+            # Extract tender ID
+            tender_id = self._extract_tender_id(element, title)
+            
+            # Extract dates
+            closing_date = await self._extract_date(element, [
+                ".closing-date", ".deadline", ".due-date", ".bid-deadline",
+                ".submission-deadline", ".closing-time"
+            ])
+            
+            posted_date = await self._extract_date(element, [
+                ".posted-date", ".publish-date", ".issue-date", ".published-date",
+                ".created-date", ".posted"
+            ]) or datetime.utcnow()
+            
+            # Extract value
+            value = await self._extract_value(element)
+            
+            # Extract URL
+            tender_url = self._extract_url(element)
+            
+            # Extract description
+            description = self._extract_text(element, [
+                ".description", ".summary", ".details", ".content",
+                ".item-description", ".listing-description"
+            ]) or ""
+            
+            tender = {
+                'tender_id': tender_id,
+                'title': title,
+                'organization': organization,
+                'portal': 'Biddingo',
+                'value': value,
+                'closing_date': closing_date,
+                'posted_date': posted_date,
+                'location': 'Canada',
+                'tender_url': tender_url,
+                'description': description,
+                'categories': [],
+                'keywords': self._extract_keywords(title, description),
+                'matching_courses': self._extract_matching_courses(title, description),
+                'priority': self._determine_priority(title, description)
+            }
+            
+            return tender
+            
+        except Exception as e:
+            logger.warning(f"Error parsing tender element: {e}")
+            return None
+    
+    def _extract_text(self, element, selectors):
+        """Extract text from element using multiple selectors"""
+        for selector in selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return found.text.strip()
+            except:
+                continue
+        return ""
+    
+    def _extract_tender_id(self, element, title):
+        """Extract tender ID from element or generate from title"""
+        # Try to find tender ID in various locations
+        id_selectors = [
+            ".tender-id", ".opportunity-id", ".bid-id", ".item-id",
+            ".listing-id", ".reference", ".ref", ".number"
+        ]
+        
+        for selector in id_selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return found.text.strip()
+            except:
+                continue
+        
+        # Generate ID from title
+        return hashlib.md5(title.encode()).hexdigest()[:8]
+    
+    async def _extract_date(self, element, selectors):
+        """Extract date from element"""
+        for selector in selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return parse_date(found.text.strip())
+            except:
+                continue
+        return None
+    
+    async def _extract_value(self, element):
+        """Extract monetary value from element"""
+        value_selectors = [
+            ".value", ".amount", ".budget", ".estimated-value",
+            ".contract-value", ".tender-value", ".bid-value"
+        ]
+        
+        for selector in value_selectors:
+            try:
+                found = element.find_element(By.CSS_SELECTOR, selector)
+                if found and found.text.strip():
+                    return parse_value(found.text.strip())
+            except:
+                continue
+        return 0.0
+    
+    def _extract_url(self, element):
+        """Extract tender URL from element"""
+        try:
+            # Look for links
+            links = element.find_elements(By.TAG_NAME, "a")
+            for link in links:
+                href = link.get_attribute('href')
+                if href and ('opportunity' in href or 'tender' in href or 'bid' in href):
+                    return href
+        except:
+            pass
+        
+        return self.base_url
+    
+    def _extract_keywords(self, title, description):
+        """Extract keywords from title and description"""
+        text = f"{title} {description}".lower()
+        keywords = []
+        
+        # Training-related keywords
+        training_keywords = [
+            'training', 'education', 'learning', 'development', 'workshop',
+            'seminar', 'course', 'certification', 'professional development',
+            'skill development', 'capacity building', 'upskilling', 'reskilling'
+        ]
+        
+        for keyword in training_keywords:
+            if keyword in text:
+                keywords.append(keyword)
+        
+        return keywords
+    
+    def _extract_matching_courses(self, title, description):
+        """Extract matching courses from title and description"""
+        text = f"{title} {description}".lower()
+        matching_courses = []
+        
+        # Map keywords to TKA courses
+        course_mapping = {
+            'project management': 'Project Management',
+            'leadership': 'Leadership',
+            'communication': 'Communication',
+            'negotiation': 'Negotiation',
+            'contract management': 'Contract Management',
+            'procurement': 'Procurement',
+            'supply chain': 'Supply Chain',
+            'risk management': 'Risk Management',
+            'strategic planning': 'Strategic Planning',
+            'change management': 'Change Management',
+            'team building': 'Team Building',
+            'conflict resolution': 'Conflict Resolution',
+            'time management': 'Time Management',
+            'problem solving': 'Problem Solving',
+            'decision making': 'Decision Making',
+            'financial management': 'Financial Management',
+            'human resources': 'Human Resources',
+            'marketing': 'Marketing',
+            'sales': 'Sales',
+            'customer service': 'Customer Service',
+            'quality management': 'Quality Management',
+            'process improvement': 'Process Improvement',
+            'innovation': 'Innovation',
+            'digital transformation': 'Digital Transformation',
+            'data analysis': 'Data Analysis',
+            'business intelligence': 'Business Intelligence',
+            'cybersecurity': 'Cybersecurity',
+            'cloud computing': 'Cloud Computing',
+            'agile': 'Agile',
+            'scrum': 'Scrum',
+            'lean six sigma': 'Lean Six Sigma',
+            'iso': 'ISO Standards',
+            'compliance': 'Compliance',
+            'regulatory': 'Regulatory Affairs'
+        }
+        
+        for keyword, course in course_mapping.items():
+            if keyword in text:
+                matching_courses.append(course)
+        
+        return matching_courses
+    
+    def _determine_priority(self, title, description):
+        """Determine priority based on content"""
+        text = f"{title} {description}".lower()
+        
+        # High priority keywords
+        high_priority = [
+            'training', 'education', 'learning', 'development', 'workshop',
+            'seminar', 'course', 'certification', 'professional development',
+            'consulting', 'advisory', 'implementation', 'change management'
+        ]
+        
+        # Medium priority keywords
+        medium_priority = [
+            'service', 'support', 'maintenance', 'management', 'administration',
+            'coordination', 'facilitation', 'delivery', 'provision'
+        ]
+        
+        for keyword in high_priority:
+            if keyword in text:
+                return 'high'
+        
+        for keyword in medium_priority:
+            if keyword in text:
+                return 'medium'
+        
+        return 'low'
+    
+    async def _go_to_next_page(self, driver):
+        """Navigate to next page"""
+        try:
+            next_selectors = [
+                "a[class*='next']",
+                "a[class*='Next']",
+                ".pagination .next",
+                "a[aria-label*='Next']",
+                "a[title*='Next']",
+                "a:contains('Next')",
+                "a:contains('>')",
+                "button[class*='next']",
+                "button:contains('Next')"
+            ]
+            
+            for selector in next_selectors:
+                try:
+                    next_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                    if next_btn and next_btn.is_displayed() and next_btn.is_enabled():
+                        driver.execute_script("arguments[0].click();", next_btn)
+                        await asyncio.sleep(3)
+                        logger.info("Navigated to next page")
+                        return True
+                except:
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error navigating to next page: {e}")
+            return False
