@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { RefreshCw, Download, Filter, Search, TrendingUp, AlertCircle, Calendar, DollarSign, Activity, BarChart3 } from 'lucide-react';
 
 // Define the 'shape' of a Tender object for TypeScript
@@ -62,7 +62,7 @@ const ProcurementDashboard: React.FC = () => {
     : '/api';
 
   // Fetch tenders from API
-  const fetchTenders = async () => {
+  const fetchTenders = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -91,10 +91,10 @@ const ProcurementDashboard: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [API_BASE, filters.portal, filters.search]);
 
   // Fetch statistics
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
       console.log('Fetching stats from:', `${API_BASE}/stats`);
       const response = await fetch(`${API_BASE}/stats`);
@@ -110,7 +110,7 @@ const ProcurementDashboard: React.FC = () => {
       console.error('Error fetching stats:', error);
       setError(error instanceof Error ? error.message : 'Unknown error occurred');
     }
-  };
+  }, [API_BASE]);
 
   // Trigger manual scan
   const triggerScan = async () => {
@@ -200,7 +200,7 @@ const ProcurementDashboard: React.FC = () => {
     }, 30000); // Refresh every 30 seconds instead of 5 minutes
     
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchTenders, fetchStats]);
 
   // Refetch when filters change
   useEffect(() => {
@@ -209,7 +209,7 @@ const ProcurementDashboard: React.FC = () => {
     }, 500);
     
     return () => clearTimeout(debounceTimer);
-  }, [filters]);
+  }, [filters, fetchTenders]);
 
   const getPriorityColor = (priority: string) => {
     switch (priority) {
