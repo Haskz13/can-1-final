@@ -410,8 +410,8 @@ const ProcurementDashboard: React.FC = () => {
                 onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setFilters({...filters, portal: e.target.value})}
               >
                 <option value="">All Portals</option>
-                {tenders.map((tender: Tender) => (
-                  <option key={tender.portal} value={tender.portal}>{tender.portal}</option>
+                {Array.from(new Set(tenders.map((tender: Tender) => tender.portal))).map((portal: string) => (
+                  <option key={portal} value={portal}>{portal}</option>
                 ))}
               </select>
             </div>

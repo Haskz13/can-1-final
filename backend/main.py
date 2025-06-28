@@ -300,7 +300,7 @@ class ProcurementScanner:
                 logger.error("Could not get driver for CanadaBuys")
                 return tenders
             
-            # Multiple search strategies to find more tenders
+            # Comprehensive search strategies to find many more tenders
             search_strategies = [
                 {"term": "training", "description": "Training services"},
                 {"term": "education", "description": "Education services"},
@@ -308,6 +308,15 @@ class ProcurementScanner:
                 {"term": "professional development", "description": "Professional development"},
                 {"term": "workshop", "description": "Workshop services"},
                 {"term": "services", "description": "General services"},
+                {"term": "advisory", "description": "Advisory services"},
+                {"term": "implementation", "description": "Implementation services"},
+                {"term": "support", "description": "Support services"},
+                {"term": "facilitation", "description": "Facilitation services"},
+                {"term": "coaching", "description": "Coaching services"},
+                {"term": "development", "description": "Development services"},
+                {"term": "management", "description": "Management services"},
+                {"term": "project", "description": "Project services"},
+                {"term": "technical", "description": "Technical services"},
                 {"term": "", "description": "All opportunities"}  # No search term to get all
             ]
             
@@ -351,7 +360,7 @@ class ProcurementScanner:
                     
                     # Process multiple pages for this search strategy
                     page_num = 1
-                    max_pages_per_strategy = 10
+                    max_pages_per_strategy = 20  # Increased from 10 to 20 for more comprehensive coverage
                     
                     while page_num <= max_pages_per_strategy:
                         try:
@@ -403,17 +412,13 @@ class ProcurementScanner:
                                     logger.error(f"Error searching for general links: {e}")
                                     tender_elements = []
                             
-                            # Parse found elements
+                            # Parse found elements - Process ALL elements, no artificial limits
                             page_tenders = []
-                            processed_count = 0
-                            for element in tender_elements[:50]:  # Limit to first 50 per page
+                            for element in tender_elements:  # Process ALL elements, not just first 50
                                 try:
                                     tender_data = self._parse_canadabuys_element(element, strategy['term'])
                                     if tender_data:
                                         page_tenders.append(tender_data)
-                                        processed_count += 1
-                                        if processed_count >= 20:  # Limit to 20 tenders per page
-                                            break
                                 except Exception as e:
                                     logger.warning(f"Error parsing CanadaBuys element: {e}")
                                     continue
