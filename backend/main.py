@@ -1252,9 +1252,9 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting procurement scanner...")
 
-    # Wait for Selenium Grid to be ready
+    # Wait for Selenium Grid to be ready (short timeout for dev environment)
     selenium_grid = SeleniumGridManager()
-    if not selenium_grid.wait_for_grid_ready():
+    if not selenium_grid.wait_for_grid_ready(timeout=10):  # Only wait 10 seconds
         logger.error("Selenium Grid failed to start, but continuing...")
 
     yield
