@@ -2,7 +2,7 @@
 import logging
 from datetime import datetime
 from typing import Dict, List
-from config import TKA_COURSES
+from backend.config import TKA_COURSES
 
 logger = logging.getLogger(__name__)
 

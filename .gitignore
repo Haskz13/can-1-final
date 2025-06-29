@@ -75,3 +75,4 @@ ENV/
 # Temporary files
 *.tmp
 *.temp
+/canada-public-sector-bid-scraper/
