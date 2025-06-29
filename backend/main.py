@@ -267,15 +267,47 @@ class ProcurementScanner:
         merx_username = os.getenv('MERX_USERNAME')
         merx_password = os.getenv('MERX_PASSWORD')
         
-        # Initialize portal scanners
+        # Initialize portal scanners - INCLUDING ALL PORTALS
         self.portals = {
+            # Main portals with dedicated scrapers
             'MERX': MERXScraper(username=os.getenv('MERX_USERNAME'), password=os.getenv('MERX_PASSWORD')),
             'CanadaBuys': CanadaBuysScraper(),
-            'BCBid': None,  # Handled by specific scan method
-            'SEAO': None,   # Handled by specific scan method
-            'Biddingo': None,  # Handled by specific scan method
-            'BidsAndTenders': None,  # Handled by specific scan method
+            
+            # Provincial portals (handled by specific scan methods)
+            'BCBid': None,  # scan_bcbid method
+            'SEAO': None,   # scan_seao_web method
+            'AlbertaPurchasing': None,  # Will use ProvincialScrapers
+            'SaskTenders': None,  # Will use ProvincialScrapers
+            'Manitoba': None,  # Will use ProvincialScrapers
+            'Ontario': None,  # Will use ProvincialScrapers
+            'NovaScotia': None,  # Will use ProvincialScrapers
+            
+            # Municipal portals (will use MunicipalScrapers)
+            'Calgary': None,
+            'Edmonton': None,
+            'Winnipeg': None,
+            'Vancouver': None,
+            'Ottawa': None,
+            'Halifax': None,
+            'Regina': None,
+            
+            # Specialized portals
+            'Biddingo': None,  # scan_biddingo method
+            'BidsAndTenders': None,  # scan_bidsandtenders_portal method
+            'NBON': None,  # Will use SpecializedScrapers
+            'PEI': None,  # Will use SpecializedScrapers
+            'NL': None,  # Will use SpecializedScrapers
+            
+            # Health/Education portals
+            'BuyBC': None,  # Will use HealthEducationScrapers
+            'OntarioHealth': None,  # Will use HealthEducationScrapers
         }
+        
+        # Store scraper classes for use in scan method
+        self.provincial_scrapers = ProvincialScrapers()
+        self.municipal_scrapers = MunicipalScrapers()
+        self.specialized_scrapers = SpecializedScrapers()
+        self.health_education_scrapers = HealthEducationScrapers()
         
         logger.info(f"Initialized scanner with {len(self.portals)} portal configurations")
         if merx_username:
@@ -1099,8 +1131,8 @@ class ProcurementScanner:
             return None
 
     async def scan(self):
-        """Enhanced scan with multiple search strategies"""
-        logger.info("Starting enhanced procurement scan with multiple strategies")
+        """Enhanced scan with multiple search strategies for ALL portals"""
+        logger.info("Starting enhanced procurement scan with multiple strategies for ALL portals")
         
         all_tenders = []
         search_strategies = generate_search_queries()
@@ -1116,6 +1148,11 @@ class ProcurementScanner:
                 if portal_scanner is None:
                     # Use specific scan methods for portals without scraper instances
                     try:
+                        # Get driver for portals that need it
+                        driver = None
+                        session = None
+                        
+                        # Main portals with custom methods
                         if portal_name == 'BCBid':
                             logger.info("Scanning BC Bid using scan_bcbid method")
                             portal_tenders = await self.scan_bcbid()
@@ -1124,22 +1161,127 @@ class ProcurementScanner:
                             portal_tenders = await self.scan_seao_web()
                         elif portal_name == 'Biddingo':
                             logger.info("Scanning Biddingo using scan_biddingo method")
-                            # Use a default config for Biddingo
                             config = {'name': 'Biddingo', 'url': 'https://www.biddingo.com'}
                             portal_tenders = await self.scan_biddingo('Biddingo', config)
                         elif portal_name == 'BidsAndTenders':
                             logger.info("Scanning Bids&Tenders using scan_bidsandtenders_portal method")
-                            # Use a default search URL for Bids&Tenders
                             search_url = 'https://www.bidsandtenders.ca/section/opportunities/opportunities.asp?type=1&show=all'
                             portal_tenders = await self.scan_bidsandtenders_portal('Bids&Tenders', search_url)
+                            
+                        # Provincial portals
+                        elif portal_name == 'AlbertaPurchasing':
+                            logger.info("Scanning Alberta Purchasing Connection")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await ProvincialScrapers.scan_alberta_purchasing(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'SaskTenders':
+                            logger.info("Scanning SaskTenders")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await ProvincialScrapers.scan_saskatchewan_tenders(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'Manitoba':
+                            logger.info("Scanning Manitoba Tenders")
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                portal_tenders = await ProvincialScrapers.scan_manitoba_tenders(session)
+                        elif portal_name == 'Ontario':
+                            logger.info("Scanning Ontario Tenders Portal")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await ProvincialScrapers.scan_ontario_tenders(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'NovaScotia':
+                            logger.info("Scanning Nova Scotia Tenders")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await ProvincialScrapers.scan_ns_tenders(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                                
+                        # Municipal portals
+                        elif portal_name == 'Ottawa':
+                            logger.info("Scanning Ottawa Bids and Tenders")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await MunicipalScrapers.scan_ottawa_bids(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'Edmonton':
+                            logger.info("Scanning Edmonton Bids and Tenders")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await MunicipalScrapers.scan_edmonton_bids(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'Calgary':
+                            logger.info("Scanning Calgary Procurement")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await MunicipalScrapers.scan_calgary_procurement(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'Winnipeg':
+                            logger.info("Scanning Winnipeg Bids")
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                portal_tenders = await MunicipalScrapers.scan_winnipeg_bids(session)
+                        elif portal_name == 'Vancouver':
+                            logger.info("Scanning Vancouver Procurement")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await MunicipalScrapers.scan_vancouver_procurement(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'Halifax':
+                            logger.info("Scanning Halifax Procurement")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await MunicipalScrapers.scan_halifax_procurement(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'Regina':
+                            logger.info("Scanning Regina Procurement")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await MunicipalScrapers.scan_regina_procurement(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                                
+                        # Specialized portals
+                        elif portal_name == 'NBON':
+                            logger.info("Scanning NBON New Brunswick")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await SpecializedScrapers.scan_nbon_newbrunswick(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'PEI':
+                            logger.info("Scanning PEI Tenders")
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                portal_tenders = await SpecializedScrapers.scan_pei_tenders(session)
+                        elif portal_name == 'NL':
+                            logger.info("Scanning NL Procurement")
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                portal_tenders = await SpecializedScrapers.scan_nl_procurement(session)
+                                
+                        # Health/Education portals
+                        elif portal_name == 'BuyBC':
+                            logger.info("Scanning BuyBC Health")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await HealthEducationScrapers.scan_buybc_health(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
+                        elif portal_name == 'OntarioHealth':
+                            logger.info("Scanning Ontario Health")
+                            driver = await self.get_driver()
+                            if driver:
+                                portal_tenders = await HealthEducationScrapers.scan_ontario_health(driver, self.selenium)
+                                self.selenium.safe_quit_driver(driver)
                         else:
                             logger.warning(f"No scanner available for portal: {portal_name}")
                             continue
+                            
                     except Exception as e:
                         logger.error(f"Error scanning {portal_name} with specific method: {e}")
                         continue
                 else:
-                    # Use the scraper instance for portals with dedicated scrapers
+                    # Use the scraper instance for portals with dedicated scrapers (MERX, CanadaBuys)
                     # Execute multiple search strategies for each portal
                     for strategy_name, queries in search_strategies.items():
                         logger.info(f"Executing {strategy_name} strategy on {portal_name}")
@@ -1219,7 +1361,7 @@ class ProcurementScanner:
         final_tenders = deduplicate_tenders(all_tenders)
         final_tenders = sorted(final_tenders, key=lambda x: x.get('relevance_score', 0), reverse=True)
         
-        logger.info(f"Enhanced scan complete: {len(all_tenders)} total results, {len(final_tenders)} unique relevant tenders")
+        logger.info(f"Enhanced scan complete: {len(all_tenders)} total results, {len(final_tenders)} unique relevant tenders from ALL {len(self.portals)} portals")
         
         # Save to database
         saved_count = 0
