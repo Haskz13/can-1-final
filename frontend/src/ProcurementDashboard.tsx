@@ -56,10 +56,8 @@ const ProcurementDashboard: React.FC = () => {
   });
   const [selectedTender, setSelectedTender] = useState<Tender | null>(null);
 
-  // Use environment variable or default to localhost for development
-  const API_BASE = (typeof window !== 'undefined' && window.location.hostname === 'localhost') 
-    ? 'http://localhost:8000/api' 
-    : '/api';
+  // Always use the proxy route for API calls
+  const API_BASE = '/api';
 
   // Fetch tenders from API
   const fetchTenders = useCallback(async () => {
