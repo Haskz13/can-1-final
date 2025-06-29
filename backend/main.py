@@ -25,16 +25,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # Import from our modules
-from models import Base, SessionLocal, Tender, save_tender_to_db, get_db  # type: ignore[reportAny]
+from backend.models import Base, SessionLocal, Tender, save_tender_to_db, get_db  # type: ignore[reportAny]
 
 # Import from selenium_utils module
-from selenium_utils import SeleniumGridManager
+from backend.selenium_utils import SeleniumGridManager
 
-from config import PORTAL_CONFIGS, TKA_COURSES
-from matcher import TenderMatcher
+from backend.config import PORTAL_CONFIGS, TKA_COURSES
+from backend.matcher import TenderMatcher
 
 # Import scrapers
-from scrapers import (
+from backend.scrapers import (
     ProvincialScrapers,
     MunicipalScrapers,
     SpecializedScrapers,

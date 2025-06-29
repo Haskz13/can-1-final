@@ -1,15 +1,69 @@
 # config.py - Shared configuration and constants
 import os
 from typing import Dict, List
+from pydantic_settings import BaseSettings
 
-# Database configuration - Use SQLite for local development
-DATABASE_URL = os.getenv('DATABASE_URL', "sqlite:///./procurement_scanner.db")
+class Settings(BaseSettings):
+    """Application settings using pydantic-settings for environment variable management"""
+    
+    # Database configuration
+    DATABASE_URL: str = "sqlite:///./procurement_scanner.db"
+    POSTGRES_USER: str = "procurement_user"
+    POSTGRES_PASSWORD: str = "procurement_pass"
+    POSTGRES_DB: str = "procurement_scanner"
+    
+    # Redis configuration
+    REDIS_URL: str = "redis://redis:6379/0"
+    
+    # Selenium configuration
+    SELENIUM_HUB_URL: str = "http://selenium-hub:4444/wd/hub"
+    SELENIUM_GRID_ENABLED: bool = True
+    
+    # API configuration
+    API_HOST: str = "0.0.0.0"
+    API_PORT: int = 8000
+    DEBUG: bool = True
+    
+    # Frontend configuration
+    REACT_APP_API_URL: str = "http://localhost:8000/api"
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    LOG_FILE: str = "logs/app.log"
+    
+    # Celery configuration
+    CELERY_BROKER_URL: str = "redis://redis:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://redis:6379/0"
+    
+    # Security
+    SECRET_KEY: str = "your-secret-key-change-in-production"
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8000"
+    
+    # MERX Portal Credentials (optional)
+    MERX_USERNAME: str = ""
+    MERX_PASSWORD: str = ""
+    
+    # Email Configuration (optional)
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    
+    # Monitoring
+    ENABLE_METRICS: bool = True
+    PROMETHEUS_PORT: int = 9090
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
 
-# Redis configuration
-REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379/0')
+# Create settings instance
+settings = Settings()
 
-# Selenium configuration
-SELENIUM_HUB_URL = os.getenv('SELENIUM_HUB_URL', 'http://selenium-hub:4444/wd/hub')
+# Legacy compatibility - keep the original constants
+DATABASE_URL = settings.DATABASE_URL
+REDIS_URL = settings.REDIS_URL
+SELENIUM_HUB_URL = settings.SELENIUM_HUB_URL
 
 # Training courses for matching
 TKA_COURSES = [

@@ -1,0 +1,23 @@
+{
+  "test_timestamp": "2025-06-28T23:00:44.334799",
+  "summary": {
+    "working_scrapers": 0,
+    "total_scrapers": 2,
+    "total_tenders": 0,
+    "total_time": 600.1690483093262
+  },
+  "detailed_results": {
+    "MERX Scraper": {
+      "tender_count": 0,
+      "duration": 300.09224247932434,
+      "error": true,
+      "timestamp": "2025-06-28T22:55:44.257388"
+    },
+    "CanadaBuys Scraper": {
+      "tender_count": 0,
+      "duration": 300.07680583000183,
+      "error": true,
+      "timestamp": "2025-06-28T23:00:44.334337"
+    }
+  }
+}
