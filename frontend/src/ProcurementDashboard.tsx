@@ -58,7 +58,7 @@ const ProcurementDashboard: React.FC = () => {
 
   // Use environment variable or default to localhost for development
   const API_BASE = (typeof window !== 'undefined' && window.location.hostname === 'localhost') 
-    ? 'http://localhost:8000/api' 
+    ? 'http://localhost:8080/api' 
     : '/api';
 
   // Fetch tenders from API
@@ -74,14 +74,29 @@ const ProcurementDashboard: React.FC = () => {
         ...(filters.search && { search: filters.search })
       });
 
-      const response = await fetch(`${API_BASE}/tenders?${params}`);
-      console.log('Response status:', response.status);
+      let response;
+      let data;
       
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+      try {
+        response = await fetch(`${API_BASE}/tenders?${params}`);
+        console.log('Response status:', response.status);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        data = await response.json();
+      } catch (apiError) {
+        console.log('API failed, trying static data:', apiError);
+        // Fallback to static data
+        response = await fetch('/api/tenders.json');
+        if (!response.ok) {
+          throw new Error('Both API and static data failed');
+        }
+        data = await response.json();
+        setError('Using demo data - API server not available');
       }
       
-      const data = await response.json();
       console.log('Received data:', data);
       setTenders(data.tenders || []);
     } catch (error) {
@@ -97,13 +112,27 @@ const ProcurementDashboard: React.FC = () => {
   const fetchStats = useCallback(async () => {
     try {
       console.log('Fetching stats from:', `${API_BASE}/stats`);
-      const response = await fetch(`${API_BASE}/stats`);
+      let response;
+      let data;
       
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+      try {
+        response = await fetch(`${API_BASE}/stats`);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        data = await response.json();
+      } catch (apiError) {
+        console.log('Stats API failed, trying static data:', apiError);
+        // Fallback to static data
+        response = await fetch('/api/stats.json');
+        if (!response.ok) {
+          throw new Error('Both stats API and static data failed');
+        }
+        data = await response.json();
       }
       
-      const data = await response.json();
       console.log('Received stats:', data);
       setStats(data);
     } catch (error) {
