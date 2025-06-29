@@ -89,7 +89,7 @@ class ProvincialScrapers:
             
             if results_table:
                 rows = results_table.find_all('tr')[1:]  # Skip header
-                for row in rows[:30]:
+                for row in rows:  # Process ALL rows, not just first 30
                     cells = row.find_all('td')
                     if len(cells) >= 5:
                         tender = {
@@ -139,7 +139,7 @@ class ProvincialScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             results = soup.find_all('div', class_='tender-result')
             
-            for result in results[:30]:
+            for result in results:  # Process ALL results, not just first 30
                 org_elem = result.find('span', class_='org')
                 organization = org_elem.text.strip() if org_elem and hasattr(org_elem, 'text') and org_elem.text else 'Saskatchewan Government'
                 closing_elem = result.find('span', class_='closing')
@@ -180,7 +180,7 @@ class ProvincialScrapers:
                     # Find tender listings
                     tender_links = soup.find_all('a', href=re.compile(r'/tenders/tender_'))
                     
-                    for link in tender_links[:30]:
+                    for link in tender_links:  # Process ALL links, not just first 30
                         tender = {
                             'tender_id': link.get('href', '').split('/')[-1].replace('.html', ''),
                             'title': link.text.strip(),
@@ -227,7 +227,7 @@ class ProvincialScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             tender_items = soup.find_all('div', class_='tender-item')
             
-            for item in tender_items[:30]:
+            for item in tender_items:  # Process ALL items, not just first 30
                 tender = {
                     'tender_id': item.get('data-id', ''),
                     'title': item.find('h3', class_='tender-title').text.strip() if item.find('h3') else '',
@@ -271,8 +271,8 @@ class ProvincialScrapers:
             results_table = soup.find('table', id='ctl00_ContentPlaceHolder1_gvTenders')
             
             if results_table:
-                rows = results_table.find_all('tr')[1:]  # Skip header
-                for row in rows[:30]:
+                rows = results_table.find_all('tr')[1:]  # Skip header  
+                for row in rows:  # Process ALL rows, not just first 30
                     cells = row.find_all('td')
                     if len(cells) >= 4:
                         tender = {
@@ -372,7 +372,7 @@ class MunicipalScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             tender_rows = soup.find_all('tr', class_='tender-row')
             
-            for row in tender_rows[:30]:
+            for row in tender_rows:  # Process ALL rows, not just first 30
                 cells = row.find_all('td')
                 if len(cells) >= 4:
                     tender = {
@@ -455,7 +455,7 @@ class MunicipalScrapers:
                     bid_table = soup.find('table', class_='bidopptable')
                     if bid_table:
                         rows = bid_table.find_all('tr')[1:]
-                        for row in rows[:30]:
+                        for row in rows:  # Process ALL rows, not just first 30
                             cells = row.find_all('td')
                             if len(cells) >= 4:
                                 tender = {
@@ -494,7 +494,7 @@ class MunicipalScrapers:
             opp_grid = soup.find('table', id='BUYER_SOURCING_SEARCH')
             if opp_grid:
                 rows = opp_grid.find_all('tr')[1:]
-                for row in rows[:30]:
+                for row in rows:  # Process ALL rows, not just first 30
                     cells = row.find_all('td')
                     if len(cells) >= 4:
                         tender = {
@@ -539,7 +539,7 @@ class MunicipalScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             results = soup.find_all('tr', class_='tender-row')
             
-            for row in results[:30]:
+            for row in results:  # Process ALL results, not just first 30
                 cells = row.find_all('td')
                 if len(cells) >= 4 and 'Halifax' in cells[2].text:
                     tender = {
@@ -587,7 +587,7 @@ class MunicipalScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             opportunities = soup.find_all('div', class_='opportunity-item')
             
-            for opp in opportunities[:30]:
+            for opp in opportunities:  # Process ALL opportunities, not just first 30
                 tender = {
                     'tender_id': opp.get('data-ref', ''),
                     'title': opp.find('h3').text.strip() if opp.find('h3') else '',
@@ -645,7 +645,7 @@ class SpecializedScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             opportunities = soup.find_all('div', class_='opportunity-listing')
             
-            for opp in opportunities[:30]:
+            for opp in opportunities:  # Process ALL opportunities, not just first 30
                 tender = {
                     'tender_id': opp.get('data-opp-id', ''),
                     'title': opp.find('h3', class_='opp-title').text.strip() if opp.find('h3', class_='opp-title') else '',
@@ -683,7 +683,7 @@ class SpecializedScrapers:
                     # Find search results
                     results = soup.find_all('li', class_='search-result')
                     
-                    for result in results[:30]:
+                    for result in results:  # Process ALL results, not just first 30
                         title_elem = result.find('h3', class_='title')
                         if title_elem:
                             # Check if training related
@@ -736,7 +736,7 @@ class SpecializedScrapers:
                     if tender_list:
                         tender_items = tender_list.find_all('div', class_='tender-item')
                         
-                        for item in tender_items[:30]:
+                        for item in tender_items:  # Process ALL items, not just first 30
                             tender = {
                                 'tender_id': item.get('data-tender-id', ''),
                                 'title': item.find('h3').text.strip() if item.find('h3') else '',
@@ -781,7 +781,7 @@ class HealthEducationScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             tender_cards = soup.find_all('div', class_='tender-card')
             
-            for card in tender_cards[:30]:
+            for card in tender_cards:  # Process ALL cards, not just first 30
                 tender = {
                     'tender_id': card.get('data-tender-id', ''),
                     'title': card.find('h3', class_='tender-title').text.strip() if card.find('h3') else '',
@@ -829,7 +829,7 @@ class HealthEducationScrapers:
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             opportunities = soup.find_all('div', class_='row')
             
-            for opp in opportunities[:20]:
+            for opp in opportunities:  # Process ALL opportunities, not just first 20
                 if 'Ontario Health' in opp.text:
                     tender = {
                         'tender_id': opp.get('data-id', ''),
