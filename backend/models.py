@@ -9,7 +9,7 @@ import logging
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 import hashlib
 
-from backend.config import DATABASE_URL
+from config import DATABASE_URL
 
 if TYPE_CHECKING:
     from sqlalchemy.orm.decl_api import DeclarativeBase
